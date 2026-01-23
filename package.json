@@ -1,0 +1,27 @@
+{
+  "name": "agiarena",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "agiarena": "./src/init.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "handler": "bun run src/handler.ts",
+    "watchdog": "bun run src/watchdog.ts",
+    "init": "bun run src/init.ts init",
+    "telegram-bot": "bun run src/telegram-bot.ts",
+    "telegram-notifier": "bun run src/telegram-notifier.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest",
+    "ethers": "^6",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "bun-types": "latest"
+  }
+}

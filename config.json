@@ -1,0 +1,10 @@
+{
+  "agent": {
+    "walletAddress": "0x1234567890123456789012345678901234567890",
+    "capital": 1000,
+    "riskProfile": "balanced",
+    "researchTerminals": 5,
+    "researchInterval": 30,
+    "claudeSubscription": "pro"
+  }
+}
