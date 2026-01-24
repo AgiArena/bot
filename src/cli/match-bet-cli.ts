@@ -16,9 +16,14 @@
 
 import {
   calculateFillAmount,
+  calculateOddsAwareFillAmount,
+  calculateOddsFavorability,
+  logOddsSizingDecision,
   formatUSDCAmount,
   addMatchedBet,
   logTransaction,
+  ODDS_ADJUSTMENT_MIN,
+  ODDS_ADJUSTMENT_MAX,
   type MatchedBet,
   type RiskProfile,
   type CounterScoresPayload
@@ -56,6 +61,78 @@ function handleCalculateFill(args: string[]): void {
     capital,
     riskProfile,
     betRemaining
+  }));
+}
+
+/**
+ * Calculate fill amount with odds-aware sizing adjustment
+ * Story 7-15: Odds-Aware Bet Sizing
+ */
+function handleCalculateFillOddsAware(args: string[]): void {
+  if (args.length < 4) {
+    console.error("Usage: calculate-fill-odds-aware <capital> <risk_profile> <bet_remaining> <odds_bps> [bet_id] [log_path]");
+    process.exit(1);
+  }
+
+  const capital = parseFloat(args[0]);
+  const riskProfile = args[1] as RiskProfile;
+  const betRemaining = args[2];
+  const oddsBps = parseInt(args[3], 10);
+  const betId = args[4] || "unknown";
+  const logPath = args[5];
+
+  if (!["conservative", "balanced", "aggressive"].includes(riskProfile)) {
+    console.error(`Invalid risk profile: ${riskProfile}. Must be conservative, balanced, or aggressive.`);
+    process.exit(1);
+  }
+
+  if (oddsBps <= 0) {
+    console.error(`Invalid oddsBps: ${oddsBps}. Must be greater than 0.`);
+    process.exit(1);
+  }
+
+  // Calculate base amount (without odds adjustment) for comparison
+  const baseAmountBaseUnits = calculateFillAmount(capital, riskProfile, betRemaining);
+  const baseAmountInt = parseInt(baseAmountBaseUnits, 10);
+
+  // Calculate odds-aware amount
+  const fillAmountBaseUnits = calculateOddsAwareFillAmount(capital, riskProfile, betRemaining, oddsBps);
+  const fillAmountInt = parseInt(fillAmountBaseUnits, 10);
+  const fillAmountFormatted = formatUSDCAmount(fillAmountBaseUnits);
+
+  // Calculate odds favorability for output
+  const { favorabilityRatio, oddsDecimal } = calculateOddsFavorability(oddsBps);
+
+  // Determine adjustment factor and if it was capped
+  const rawAdjustment = favorabilityRatio;
+  const clampedAdjustment = Math.min(ODDS_ADJUSTMENT_MAX, Math.max(ODDS_ADJUSTMENT_MIN, rawAdjustment));
+  const wasCapped = rawAdjustment !== clampedAdjustment;
+
+  // Log if log_path provided (AC6: Logging)
+  if (logPath) {
+    logOddsSizingDecision(
+      logPath,
+      betId,
+      oddsBps,
+      clampedAdjustment,
+      baseAmountInt,
+      fillAmountInt,
+      wasCapped
+    );
+  }
+
+  console.log(JSON.stringify({
+    fillAmountBaseUnits,
+    fillAmountFormatted,
+    baseAmountBaseUnits,
+    capital,
+    riskProfile,
+    betRemaining,
+    oddsBps,
+    oddsDecimal,
+    favorabilityRatio,
+    adjustmentFactor: clampedAdjustment,
+    wasCapped
   }));
 }
 
@@ -220,7 +297,7 @@ async function main() {
 
   if (args.length < 1) {
     console.error("Usage: match-bet-cli.ts <command> [args...]");
-    console.error("Commands: calculate-fill, record-match, log-transaction, upload-scores");
+    console.error("Commands: calculate-fill, calculate-fill-odds-aware, record-match, log-transaction, upload-scores");
     process.exit(1);
   }
 
@@ -230,6 +307,10 @@ async function main() {
   switch (command) {
     case "calculate-fill":
       handleCalculateFill(commandArgs);
+      break;
+
+    case "calculate-fill-odds-aware":
+      handleCalculateFillOddsAware(commandArgs);
       break;
 
     case "record-match":
@@ -246,7 +327,7 @@ async function main() {
 
     default:
       console.error(`Unknown command: ${command}`);
-      console.error("Commands: calculate-fill, record-match, log-transaction, upload-scores");
+      console.error("Commands: calculate-fill, calculate-fill-odds-aware, record-match, log-transaction, upload-scores");
       process.exit(1);
   }
 }

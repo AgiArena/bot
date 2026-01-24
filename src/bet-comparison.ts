@@ -11,6 +11,201 @@ export interface BetPosition {
 }
 
 /**
+ * Result of odds-adjusted EV calculation
+ *
+ * With asymmetric odds, matcher needs different edge to profit.
+ * Example: At 2.00x odds (oddsBps = 20000, matcher risks $50 to win $150):
+ * - Matcher only needs >33% win probability to be +EV
+ * - Standard 1.00x requires >50%
+ */
+export interface OddsAdjustedEV {
+  /** Base EV without odds consideration */
+  rawEV: number;
+  /** Decimal odds (2.0 = 2.00x) */
+  oddsDecimal: number;
+  /** How odds affect EV (>1 = favorable for matcher) */
+  oddsMultiplier: number;
+  /** Final EV considering odds adjustment */
+  adjustedEV: number;
+  /** Minimum edge needed given odds (negative = favorable) */
+  requiredEdge: number;
+  /** Recommendation based on adjusted EV and dynamic thresholds */
+  recommendation: Recommendation;
+}
+
+/**
+ * Result of matcher return calculation
+ */
+export interface MatcherReturnResult {
+  /** Total return multiplier for matcher (e.g., 3.0 at 2.0x odds) */
+  matcherReturn: number;
+  /** Win probability needed to break even (e.g., 0.333 at 2.0x odds) */
+  impliedProbNeeded: number;
+}
+
+// ============================================================================
+// ODDS CONVERSION FUNCTIONS
+// ============================================================================
+
+/**
+ * Convert basis points to decimal odds
+ *
+ * @param bps - Odds in basis points (10000 = 1.0, 20000 = 2.0)
+ * @returns Decimal odds
+ * @throws Error if bps is <= 0
+ *
+ * @example
+ * bpsToDecimal(10000) // => 1.0
+ * bpsToDecimal(20000) // => 2.0
+ * bpsToDecimal(5000)  // => 0.5
+ */
+export function bpsToDecimal(bps: number): number {
+  if (bps <= 0) {
+    throw new Error(`Invalid oddsBps: ${bps}. Must be greater than 0.`);
+  }
+  return bps / 10000;
+}
+
+/**
+ * Convert decimal odds to basis points
+ *
+ * @param decimal - Decimal odds (1.0 = fair, 2.0 = 2x)
+ * @returns Odds in basis points
+ * @throws Error if decimal is <= 0
+ *
+ * @example
+ * decimalToBps(1.0) // => 10000
+ * decimalToBps(2.0) // => 20000
+ * decimalToBps(0.5) // => 5000
+ */
+export function decimalToBps(decimal: number): number {
+  if (decimal <= 0) {
+    throw new Error(`Invalid decimal odds: ${decimal}. Must be greater than 0.`);
+  }
+  return Math.round(decimal * 10000);
+}
+
+/**
+ * Calculate matcher return multiplier and implied probability
+ *
+ * At different odds, matcher gets different returns:
+ * - 1.0x odds: matcher risks $100 to win $100, return = 2x (needs 50% to break even)
+ * - 2.0x odds: matcher risks $50 to win $150, return = 3x (needs 33% to break even)
+ * - 0.5x odds: matcher risks $200 to win $100, return = 1.5x (needs 67% to break even)
+ *
+ * @param oddsDecimal - Decimal odds
+ * @returns Matcher return and implied probability needed
+ */
+export function calculateMatcherReturn(oddsDecimal: number): MatcherReturnResult {
+  // matcherReturn = oddsDecimal + 1
+  // At 2.0x: matcher risks 0.5 units, wins 1.5 units total = 3x return
+  const matcherReturn = oddsDecimal + 1;
+
+  // Implied probability to break even = 1 / matcherReturn
+  const impliedProbNeeded = 1 / matcherReturn;
+
+  return {
+    matcherReturn,
+    impliedProbNeeded
+  };
+}
+
+/**
+ * Get odds-adjusted recommendation with dynamic thresholds
+ *
+ * With favorable odds (>1 multiplier), lower thresholds are needed.
+ * With unfavorable odds (<1 multiplier), higher thresholds are needed.
+ *
+ * Standard thresholds at 1.0x odds:
+ * - STRONG_MATCH: > 15
+ * - MATCH: >= 10
+ * - CONSIDER: >= 5
+ * - LEAN_SKIP: > 0
+ * - SKIP: <= 0
+ *
+ * @param adjustedEV - The odds-adjusted EV
+ * @param oddsMultiplier - How favorable the odds are (>1 = favorable)
+ * @returns Recommendation level
+ */
+export function getOddsAdjustedRecommendation(
+  adjustedEV: number,
+  oddsMultiplier: number
+): Recommendation {
+  // Adjust thresholds based on odds favorability
+  // Favorable odds (high multiplier) → lower thresholds
+  // Unfavorable odds (low multiplier) → higher thresholds
+  const threshold = {
+    strongMatch: 15 / oddsMultiplier,
+    match: 10 / oddsMultiplier,
+    consider: 5 / oddsMultiplier,
+  };
+
+  if (adjustedEV > threshold.strongMatch) return "STRONG_MATCH";
+  if (adjustedEV >= threshold.match) return "MATCH";
+  if (adjustedEV >= threshold.consider) return "CONSIDER";
+  if (adjustedEV > 0) return "LEAN_SKIP";
+  return "SKIP";
+}
+
+/**
+ * Calculate EV adjusted for bet odds
+ *
+ * With asymmetric odds, matcher needs less edge to profit at favorable odds.
+ *
+ * @param ourPortfolio - Our aggregated portfolio scores
+ * @param betPositions - The bet's positions to compare against
+ * @param oddsBps - Odds in basis points (10000 = 1.0x, 20000 = 2.0x)
+ * @returns Odds-adjusted EV result
+ *
+ * @example
+ * // At 2.00x odds (favorable for matcher):
+ * // - Raw EV: +10%
+ * // - Odds multiplier: 1.5 (favorable)
+ * // - Adjusted EV: +15%
+ * // - Required edge: -16.7% (negative = favorable)
+ */
+export function calculateOddsAdjustedEV(
+  ourPortfolio: AggregatedPortfolio,
+  betPositions: BetPosition[],
+  oddsBps: number
+): OddsAdjustedEV {
+  // Base EV calculation (unchanged)
+  const baseResult = calculateEV(ourPortfolio, betPositions);
+  const rawEV = baseResult.weightedEV;
+
+  // Convert basis points to decimal (20000 -> 2.0)
+  const oddsDecimal = bpsToDecimal(oddsBps);
+
+  // Calculate matcher return multiplier
+  const { impliedProbNeeded } = calculateMatcherReturn(oddsDecimal);
+
+  // Odds multiplier: how much the odds favor the matcher
+  // At fair odds (1.00x), this equals 1.0
+  // At favorable odds (2.00x), matcher only needs 33% to break even vs 50%
+  const fairProbNeeded = 0.5;
+  const oddsMultiplier = fairProbNeeded / impliedProbNeeded;
+
+  // Adjusted EV: our edge * how much odds favor us
+  const adjustedEV = rawEV * oddsMultiplier;
+
+  // Required edge at these odds (lower for favorable odds)
+  // Negative value means odds are favorable (need less edge)
+  const requiredEdge = (impliedProbNeeded - 0.5) * 100;
+
+  // Adjust recommendation thresholds based on odds
+  const recommendation = getOddsAdjustedRecommendation(adjustedEV, oddsMultiplier);
+
+  return {
+    rawEV,
+    oddsDecimal,
+    oddsMultiplier: Math.round(oddsMultiplier * 100) / 100,
+    adjustedEV: Math.round(adjustedEV * 100) / 100,
+    requiredEdge: Math.round(requiredEdge * 100) / 100,
+    recommendation
+  };
+}
+
+/**
  * Result of EV calculation
  */
 export interface EVResult {

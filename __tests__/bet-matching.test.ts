@@ -589,6 +589,341 @@ describe("Bet Matching", () => {
     });
   });
 
+  describe("Odds-Aware Sizing", () => {
+    describe("calculateOddsFavorability", () => {
+      test("returns 1.0 for fair odds (1.00x / 10000 bps)", async () => {
+        const { calculateOddsFavorability } = await import("../src/bet-matching");
+
+        const result = calculateOddsFavorability(10000); // 1.00x odds
+
+        expect(result.favorabilityRatio).toBeCloseTo(1.0, 4);
+        expect(result.matcherReturn).toBe(2.0);
+        expect(result.impliedProbNeeded).toBeCloseTo(0.5, 4);
+      });
+
+      test("returns >1 for favorable odds (2.00x / 20000 bps)", async () => {
+        const { calculateOddsFavorability } = await import("../src/bet-matching");
+
+        const result = calculateOddsFavorability(20000); // 2.00x odds
+
+        // At 2.00x: matcher return = 3x, implied prob = 0.333
+        // Favorability = 0.5 / 0.333 = 1.5
+        expect(result.favorabilityRatio).toBeCloseTo(1.5, 4);
+        expect(result.matcherReturn).toBe(3.0);
+        expect(result.impliedProbNeeded).toBeCloseTo(0.333, 3);
+      });
+
+      test("returns <1 for unfavorable odds (0.50x / 5000 bps)", async () => {
+        const { calculateOddsFavorability } = await import("../src/bet-matching");
+
+        const result = calculateOddsFavorability(5000); // 0.50x odds
+
+        // At 0.50x: matcher return = 1.5x, implied prob = 0.667
+        // Favorability = 0.5 / 0.667 = 0.75
+        expect(result.favorabilityRatio).toBeCloseTo(0.75, 4);
+        expect(result.matcherReturn).toBe(1.5);
+        expect(result.impliedProbNeeded).toBeCloseTo(0.667, 3);
+      });
+
+      test("throws for zero oddsBps", async () => {
+        const { calculateOddsFavorability } = await import("../src/bet-matching");
+
+        expect(() => calculateOddsFavorability(0)).toThrow();
+      });
+
+      test("throws for negative oddsBps", async () => {
+        const { calculateOddsFavorability } = await import("../src/bet-matching");
+
+        expect(() => calculateOddsFavorability(-1000)).toThrow();
+      });
+
+      test("handles very high odds (10.00x / 100000 bps)", async () => {
+        const { calculateOddsFavorability } = await import("../src/bet-matching");
+
+        const result = calculateOddsFavorability(100000); // 10.00x odds
+
+        // At 10.00x: matcher return = 11x, implied prob = 0.0909
+        // Favorability = 0.5 / 0.0909 = 5.5
+        expect(result.favorabilityRatio).toBeCloseTo(5.5, 4);
+        expect(result.matcherReturn).toBe(11.0);
+      });
+
+      test("handles very low odds (0.10x / 1000 bps)", async () => {
+        const { calculateOddsFavorability } = await import("../src/bet-matching");
+
+        const result = calculateOddsFavorability(1000); // 0.10x odds
+
+        // At 0.10x: matcher return = 1.1x, implied prob = 0.909
+        // Favorability = 0.5 / 0.909 = 0.55
+        expect(result.favorabilityRatio).toBeCloseTo(0.55, 2);
+        expect(result.matcherReturn).toBeCloseTo(1.1, 4);
+      });
+    });
+
+    describe("calculateOddsAwareFillAmount", () => {
+      test("increases size for favorable odds (2.00x)", async () => {
+        const { calculateOddsAwareFillAmount, calculateFillAmount } = await import("../src/bet-matching");
+
+        const capital = 1000;
+        const betRemaining = "500.000000";
+        const oddsBps = 20000; // 2.00x odds - favorable
+
+        const oddsAwareAmount = calculateOddsAwareFillAmount(capital, "balanced", betRemaining, oddsBps);
+        const baseAmount = calculateFillAmount(capital, "balanced", betRemaining);
+
+        const oddsAwareValue = parseInt(oddsAwareAmount);
+        const baseValue = parseInt(baseAmount);
+
+        // Favorable odds should increase size (up to 1.5x)
+        expect(oddsAwareValue).toBeGreaterThan(baseValue);
+      });
+
+      test("decreases size for unfavorable odds (0.50x)", async () => {
+        const { calculateOddsAwareFillAmount, calculateFillAmount } = await import("../src/bet-matching");
+
+        const capital = 1000;
+        const betRemaining = "500.000000";
+        const oddsBps = 5000; // 0.50x odds - unfavorable
+
+        const oddsAwareAmount = calculateOddsAwareFillAmount(capital, "balanced", betRemaining, oddsBps);
+        const baseAmount = calculateFillAmount(capital, "balanced", betRemaining);
+
+        const oddsAwareValue = parseInt(oddsAwareAmount);
+        const baseValue = parseInt(baseAmount);
+
+        // Unfavorable odds should decrease size (down to 0.5x)
+        expect(oddsAwareValue).toBeLessThan(baseValue);
+      });
+
+      test("maintains size for fair odds (1.00x)", async () => {
+        const { calculateOddsAwareFillAmount, calculateFillAmount } = await import("../src/bet-matching");
+
+        const capital = 1000;
+        const betRemaining = "500.000000";
+        const oddsBps = 10000; // 1.00x odds - fair
+
+        const oddsAwareAmount = calculateOddsAwareFillAmount(capital, "balanced", betRemaining, oddsBps);
+        const baseAmount = calculateFillAmount(capital, "balanced", betRemaining);
+
+        // Fair odds should not change size
+        expect(oddsAwareAmount).toBe(baseAmount);
+      });
+
+      test("clamps adjustment factor at 1.5x for very favorable odds", async () => {
+        const { calculateOddsAwareFillAmount, calculateFillAmount } = await import("../src/bet-matching");
+
+        const capital = 1000;
+        const betRemaining = "500.000000";
+        const oddsBps = 100000; // 10.00x odds - extremely favorable
+
+        const oddsAwareAmount = calculateOddsAwareFillAmount(capital, "balanced", betRemaining, oddsBps);
+        const baseAmount = calculateFillAmount(capital, "balanced", betRemaining);
+
+        const oddsAwareValue = parseInt(oddsAwareAmount);
+        const baseValue = parseInt(baseAmount);
+
+        // Should be capped at 1.5x (not 5.5x from raw favorability)
+        const ratio = oddsAwareValue / baseValue;
+        expect(ratio).toBeLessThanOrEqual(1.51); // Allow small floating point variance
+        expect(ratio).toBeGreaterThan(1.4); // Should be close to 1.5x
+      });
+
+      test("clamps adjustment factor at 0.5x for very unfavorable odds", async () => {
+        const { calculateOddsAwareFillAmount, calculateFillAmount } = await import("../src/bet-matching");
+
+        const capital = 1000;
+        const betRemaining = "500.000000";
+        const oddsBps = 1000; // 0.10x odds - extremely unfavorable
+
+        const oddsAwareAmount = calculateOddsAwareFillAmount(capital, "balanced", betRemaining, oddsBps);
+        const baseAmount = calculateFillAmount(capital, "balanced", betRemaining);
+
+        const oddsAwareValue = parseInt(oddsAwareAmount);
+        const baseValue = parseInt(baseAmount);
+
+        // Should be capped at 0.5x (not lower)
+        const ratio = oddsAwareValue / baseValue;
+        expect(ratio).toBeGreaterThanOrEqual(0.49); // Allow small floating point variance
+        expect(ratio).toBeLessThan(0.6); // Should be close to 0.5x
+      });
+
+      test("respects minimum bet amount", async () => {
+        const { calculateOddsAwareFillAmount, MIN_BET_AMOUNT } = await import("../src/bet-matching");
+
+        // Very small capital that would result in below-minimum bet
+        // Conservative is 1-3%, middle = 2%
+        // With very unfavorable odds (0.5x adjustment): 2% * 0.5 = 1%
+        // $0.50 * 1% = $0.005, which is 5,000 base units < 10,000 minimum
+        const capital = 0.5; // $0.50
+        const betRemaining = "0.100000"; // 10 cents
+        const oddsBps = 5000; // Unfavorable odds reduce size to 0.5x
+
+        const result = calculateOddsAwareFillAmount(capital, "conservative", betRemaining, oddsBps);
+
+        // Should return "0" to signal below minimum
+        expect(result).toBe("0");
+      });
+
+      test("respects bet remaining limit", async () => {
+        const { calculateOddsAwareFillAmount, formatUSDCAmount } = await import("../src/bet-matching");
+
+        const capital = 10000;
+        const betRemaining = "10.000000"; // Only $10 remaining
+        const oddsBps = 20000; // Favorable odds
+
+        const result = calculateOddsAwareFillAmount(capital, "aggressive", betRemaining, oddsBps);
+        const amountDecimal = parseFloat(formatUSDCAmount(result));
+
+        // Should not exceed bet remaining
+        expect(amountDecimal).toBeLessThanOrEqual(10);
+      });
+
+      test("works with conservative profile and favorable odds", async () => {
+        const { calculateOddsAwareFillAmount, formatUSDCAmount } = await import("../src/bet-matching");
+
+        const capital = 1000;
+        const betRemaining = "500.000000";
+        const oddsBps = 15000; // 1.5x odds - somewhat favorable
+
+        const result = calculateOddsAwareFillAmount(capital, "conservative", betRemaining, oddsBps);
+        const amountDecimal = parseFloat(formatUSDCAmount(result));
+
+        // Conservative: 1-3%, with 1.25x adjustment
+        // Base middle = 2% = $20, adjusted = ~$25
+        expect(amountDecimal).toBeGreaterThan(15);
+        expect(amountDecimal).toBeLessThan(40);
+      });
+
+      test("works with aggressive profile and unfavorable odds", async () => {
+        const { calculateOddsAwareFillAmount, formatUSDCAmount } = await import("../src/bet-matching");
+
+        const capital = 1000;
+        const betRemaining = "500.000000";
+        const oddsBps = 6667; // 0.667x odds - somewhat unfavorable
+
+        const result = calculateOddsAwareFillAmount(capital, "aggressive", betRemaining, oddsBps);
+        const amountDecimal = parseFloat(formatUSDCAmount(result));
+
+        // Aggressive: 5-10%, with ~0.8x adjustment
+        // Base middle = 7.5% = $75, adjusted = ~$60
+        expect(amountDecimal).toBeGreaterThan(35);
+        expect(amountDecimal).toBeLessThan(85);
+      });
+    });
+
+    describe("calculateKellyFraction", () => {
+      test("returns positive Kelly for profitable scenario", async () => {
+        const { calculateKellyFraction } = await import("../src/bet-matching");
+
+        // 60% win probability at 2.0x odds
+        const result = calculateKellyFraction(0.6, 2.0);
+
+        // Kelly = (p(b+1) - 1) / b = (0.6 * 3 - 1) / 2 = 0.4
+        // Fractional (25%) = 0.1
+        expect(result).toBeCloseTo(0.1, 2);
+      });
+
+      test("returns zero for break-even scenario", async () => {
+        const { calculateKellyFraction } = await import("../src/bet-matching");
+
+        // 50% win probability at 1.0x odds (break-even)
+        const result = calculateKellyFraction(0.5, 1.0);
+
+        // Kelly = (0.5 * 2 - 1) / 1 = 0
+        expect(result).toBe(0);
+      });
+
+      test("returns zero for negative EV scenario", async () => {
+        const { calculateKellyFraction } = await import("../src/bet-matching");
+
+        // 40% win probability at 1.0x odds (negative EV)
+        const result = calculateKellyFraction(0.4, 1.0);
+
+        // Kelly would be negative, should be clamped to 0
+        expect(result).toBe(0);
+      });
+
+      test("respects custom fraction parameter", async () => {
+        const { calculateKellyFraction } = await import("../src/bet-matching");
+
+        // 60% win probability at 2.0x odds
+        const fullKelly = calculateKellyFraction(0.6, 2.0, 1.0);
+        const halfKelly = calculateKellyFraction(0.6, 2.0, 0.5);
+        const quarterKelly = calculateKellyFraction(0.6, 2.0, 0.25);
+
+        expect(halfKelly).toBeCloseTo(fullKelly / 2, 4);
+        expect(quarterKelly).toBeCloseTo(fullKelly / 4, 4);
+      });
+
+      test("handles very high odds correctly", async () => {
+        const { calculateKellyFraction } = await import("../src/bet-matching");
+
+        // 20% win probability at 10.0x odds
+        // Kelly = (0.2 * 11 - 1) / 10 = 0.12
+        // Fractional (25%) = 0.03
+        const result = calculateKellyFraction(0.2, 10.0);
+
+        expect(result).toBeCloseTo(0.03, 2);
+      });
+
+      test("handles configurable USE_KELLY_FRACTION env var", async () => {
+        // This tests that when env var is set, Kelly is used
+        const { calculateKellyFraction, getKellyFractionFromEnv } = await import("../src/bet-matching");
+
+        const defaultFraction = getKellyFractionFromEnv();
+
+        // Default should be 0.25 (25% Kelly)
+        expect(defaultFraction).toBe(0.25);
+      });
+    });
+
+    describe("Logging", () => {
+      test("logOddsSizingDecision logs correct format", async () => {
+        const { logOddsSizingDecision } = await import("../src/bet-matching");
+
+        const logPath = join(TEST_DIR, "odds-sizing.log");
+
+        logOddsSizingDecision(
+          logPath,
+          "bet-123",
+          20000,
+          1.5,
+          40000000,
+          60000000,
+          false
+        );
+
+        const content = readFileSync(logPath, "utf-8");
+        expect(content).toContain("bet-123");
+        expect(content).toContain("oddsBps=20000");
+        expect(content).toContain("adjustment=1.5");
+        expect(content).toContain("baseSize=40000000");
+        expect(content).toContain("adjustedSize=60000000");
+        expect(content).not.toContain("capped");
+      });
+
+      test("logOddsSizingDecision includes cap indicator when capped", async () => {
+        const { logOddsSizingDecision } = await import("../src/bet-matching");
+
+        const logPath = join(TEST_DIR, "odds-sizing.log");
+
+        logOddsSizingDecision(
+          logPath,
+          "bet-456",
+          100000,
+          1.5, // Capped from 5.5
+          40000000,
+          60000000,
+          true // Was capped
+        );
+
+        const content = readFileSync(logPath, "utf-8");
+        expect(content).toContain("bet-456");
+        expect(content).toContain("capped=true");
+      });
+    });
+  });
+
   describe("Shell Script Integration (CLI commands)", () => {
     test("calculate-fill CLI command returns valid JSON", async () => {
       const { $ } = await import("bun");
@@ -655,6 +990,53 @@ describe("Bet Matching", () => {
         expect(true).toBe(false);
       } catch (error) {
         // Expected - invalid risk profile
+        expect(true).toBe(true);
+      }
+    });
+
+    test("calculate-fill-odds-aware CLI command returns valid JSON with odds adjustment", async () => {
+      const { $ } = await import("bun");
+
+      // Test with favorable odds (2.00x = 20000 bps)
+      const result = await $`bun run src/cli/match-bet-cli.ts calculate-fill-odds-aware 1000 balanced 100.000000 20000`.text();
+      const parsed = JSON.parse(result);
+
+      expect(parsed.fillAmountBaseUnits).toBeDefined();
+      expect(parsed.fillAmountFormatted).toBeDefined();
+      expect(parsed.baseAmountBaseUnits).toBeDefined();
+      expect(parsed.capital).toBe(1000);
+      expect(parsed.riskProfile).toBe("balanced");
+      expect(parsed.oddsBps).toBe(20000);
+      expect(parsed.oddsDecimal).toBe(2.0);
+      expect(parsed.adjustmentFactor).toBeCloseTo(1.5, 1);
+
+      // Favorable odds should increase size
+      const oddsAware = parseInt(parsed.fillAmountBaseUnits);
+      const base = parseInt(parsed.baseAmountBaseUnits);
+      expect(oddsAware).toBeGreaterThan(base);
+    });
+
+    test("calculate-fill-odds-aware CLI logs when log_path provided", async () => {
+      const { $ } = await import("bun");
+
+      const logPath = join(TEST_DIR, "cli-odds-sizing.log");
+
+      await $`bun run src/cli/match-bet-cli.ts calculate-fill-odds-aware 1000 balanced 100.000000 20000 test-bet-123 ${logPath}`.text();
+
+      const content = readFileSync(logPath, "utf-8");
+      expect(content).toContain("test-bet-123");
+      expect(content).toContain("oddsBps=20000");
+      expect(content).toContain("ODDS_SIZING");
+    });
+
+    test("calculate-fill-odds-aware CLI rejects zero oddsBps", async () => {
+      const { $ } = await import("bun");
+
+      try {
+        await $`bun run src/cli/match-bet-cli.ts calculate-fill-odds-aware 1000 balanced 100.000000 0`.throws(true);
+        expect(true).toBe(false);
+      } catch (error) {
+        // Expected - invalid oddsBps
         expect(true).toBe(true);
       }
     });

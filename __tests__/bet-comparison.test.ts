@@ -266,6 +266,250 @@ describe("Bet Comparison", () => {
     });
   });
 
+  describe("Odds-Adjusted EV Calculations", () => {
+    describe("bpsToDecimal", () => {
+      test("converts 10000 bps to 1.0 decimal", async () => {
+        const { bpsToDecimal } = await import("../src/bet-comparison");
+        expect(bpsToDecimal(10000)).toBe(1.0);
+      });
+
+      test("converts 20000 bps to 2.0 decimal", async () => {
+        const { bpsToDecimal } = await import("../src/bet-comparison");
+        expect(bpsToDecimal(20000)).toBe(2.0);
+      });
+
+      test("converts 5000 bps to 0.5 decimal", async () => {
+        const { bpsToDecimal } = await import("../src/bet-comparison");
+        expect(bpsToDecimal(5000)).toBe(0.5);
+      });
+
+      test("converts 15000 bps to 1.5 decimal", async () => {
+        const { bpsToDecimal } = await import("../src/bet-comparison");
+        expect(bpsToDecimal(15000)).toBe(1.5);
+      });
+
+      test("throws error for zero bps", async () => {
+        const { bpsToDecimal } = await import("../src/bet-comparison");
+        expect(() => bpsToDecimal(0)).toThrow("Invalid oddsBps: 0");
+      });
+
+      test("throws error for negative bps", async () => {
+        const { bpsToDecimal } = await import("../src/bet-comparison");
+        expect(() => bpsToDecimal(-5000)).toThrow("Invalid oddsBps: -5000");
+      });
+    });
+
+    describe("decimalToBps", () => {
+      test("converts 1.0 decimal to 10000 bps", async () => {
+        const { decimalToBps } = await import("../src/bet-comparison");
+        expect(decimalToBps(1.0)).toBe(10000);
+      });
+
+      test("converts 2.0 decimal to 20000 bps", async () => {
+        const { decimalToBps } = await import("../src/bet-comparison");
+        expect(decimalToBps(2.0)).toBe(20000);
+      });
+
+      test("converts 0.5 decimal to 5000 bps", async () => {
+        const { decimalToBps } = await import("../src/bet-comparison");
+        expect(decimalToBps(0.5)).toBe(5000);
+      });
+
+      test("throws error for zero decimal", async () => {
+        const { decimalToBps } = await import("../src/bet-comparison");
+        expect(() => decimalToBps(0)).toThrow("Invalid decimal odds: 0");
+      });
+
+      test("throws error for negative decimal", async () => {
+        const { decimalToBps } = await import("../src/bet-comparison");
+        expect(() => decimalToBps(-1.5)).toThrow("Invalid decimal odds: -1.5");
+      });
+    });
+
+    describe("calculateMatcherReturn", () => {
+      test("calculates 3x return at 2.0 odds", async () => {
+        const { calculateMatcherReturn } = await import("../src/bet-comparison");
+        const result = calculateMatcherReturn(2.0);
+        expect(result.matcherReturn).toBe(3.0);
+        expect(result.impliedProbNeeded).toBeCloseTo(0.333, 2);
+      });
+
+      test("calculates 2x return at 1.0 odds (fair)", async () => {
+        const { calculateMatcherReturn } = await import("../src/bet-comparison");
+        const result = calculateMatcherReturn(1.0);
+        expect(result.matcherReturn).toBe(2.0);
+        expect(result.impliedProbNeeded).toBe(0.5);
+      });
+
+      test("calculates 1.5x return at 0.5 odds", async () => {
+        const { calculateMatcherReturn } = await import("../src/bet-comparison");
+        const result = calculateMatcherReturn(0.5);
+        expect(result.matcherReturn).toBe(1.5);
+        expect(result.impliedProbNeeded).toBeCloseTo(0.667, 2);
+      });
+    });
+
+    describe("calculateOddsAdjustedEV", () => {
+      test("adjusts EV upward for favorable odds (2.0x)", async () => {
+        const { calculateOddsAdjustedEV } = await import("../src/bet-comparison");
+
+        const ourPortfolio: AggregatedPortfolio = {
+          "0xmarket1": { score: 60, position: 1, confidence: 0.8 }
+        };
+
+        const betPositions: BetPosition[] = [
+          { marketId: "0xmarket1", position: "NO", startingPrice: "0.5", endingPrice: null }
+        ];
+
+        const result = calculateOddsAdjustedEV(ourPortfolio, betPositions, 20000);
+
+        // Raw EV = 60 - 50 = 10
+        // Odds multiplier at 2.0x = 0.5 / (1/3) = 1.5
+        // Adjusted EV = 10 * 1.5 = 15
+        expect(result.rawEV).toBe(10);
+        expect(result.oddsDecimal).toBe(2.0);
+        expect(result.oddsMultiplier).toBeCloseTo(1.5, 1);
+        expect(result.adjustedEV).toBeCloseTo(15, 0);
+        expect(result.requiredEdge).toBeLessThan(0); // Negative = favorable
+      });
+
+      test("adjusts EV downward for unfavorable odds (0.5x)", async () => {
+        const { calculateOddsAdjustedEV } = await import("../src/bet-comparison");
+
+        const ourPortfolio: AggregatedPortfolio = {
+          "0xmarket1": { score: 60, position: 1, confidence: 0.8 }
+        };
+
+        const betPositions: BetPosition[] = [
+          { marketId: "0xmarket1", position: "NO", startingPrice: "0.5", endingPrice: null }
+        ];
+
+        const result = calculateOddsAdjustedEV(ourPortfolio, betPositions, 5000);
+
+        // Raw EV = 10
+        // Odds multiplier at 0.5x = 0.5 / 0.667 = 0.75
+        // Adjusted EV = 10 * 0.75 = 7.5
+        expect(result.rawEV).toBe(10);
+        expect(result.oddsDecimal).toBe(0.5);
+        expect(result.oddsMultiplier).toBeCloseTo(0.75, 1);
+        expect(result.adjustedEV).toBeCloseTo(7.5, 0);
+        expect(result.requiredEdge).toBeGreaterThan(0); // Positive = unfavorable
+      });
+
+      test("returns unchanged EV at fair odds (1.0x)", async () => {
+        const { calculateOddsAdjustedEV } = await import("../src/bet-comparison");
+
+        const ourPortfolio: AggregatedPortfolio = {
+          "0xmarket1": { score: 60, position: 1, confidence: 0.8 }
+        };
+
+        const betPositions: BetPosition[] = [
+          { marketId: "0xmarket1", position: "NO", startingPrice: "0.5", endingPrice: null }
+        ];
+
+        const result = calculateOddsAdjustedEV(ourPortfolio, betPositions, 10000);
+
+        expect(result.rawEV).toBe(10);
+        expect(result.oddsDecimal).toBe(1.0);
+        expect(result.oddsMultiplier).toBe(1.0);
+        expect(result.adjustedEV).toBe(10);
+        expect(result.requiredEdge).toBe(0);
+      });
+
+      test("handles edge case of very high odds (5.0x)", async () => {
+        const { calculateOddsAdjustedEV } = await import("../src/bet-comparison");
+
+        const ourPortfolio: AggregatedPortfolio = {
+          "0xmarket1": { score: 60, position: 1, confidence: 0.8 }
+        };
+
+        const betPositions: BetPosition[] = [
+          { marketId: "0xmarket1", position: "NO", startingPrice: "0.5", endingPrice: null }
+        ];
+
+        const result = calculateOddsAdjustedEV(ourPortfolio, betPositions, 50000);
+
+        expect(result.oddsDecimal).toBe(5.0);
+        expect(result.oddsMultiplier).toBeGreaterThan(1.5);
+        expect(result.adjustedEV).toBeGreaterThan(result.rawEV);
+      });
+
+      test("handles edge case of very low odds (0.1x)", async () => {
+        const { calculateOddsAdjustedEV } = await import("../src/bet-comparison");
+
+        const ourPortfolio: AggregatedPortfolio = {
+          "0xmarket1": { score: 60, position: 1, confidence: 0.8 }
+        };
+
+        const betPositions: BetPosition[] = [
+          { marketId: "0xmarket1", position: "NO", startingPrice: "0.5", endingPrice: null }
+        ];
+
+        const result = calculateOddsAdjustedEV(ourPortfolio, betPositions, 1000);
+
+        expect(result.oddsDecimal).toBe(0.1);
+        expect(result.oddsMultiplier).toBeLessThan(1.0);
+        expect(result.adjustedEV).toBeLessThan(result.rawEV);
+      });
+    });
+
+    describe("getOddsAdjustedRecommendation", () => {
+      test("lowers thresholds for favorable odds", async () => {
+        const { getOddsAdjustedRecommendation } = await import("../src/bet-comparison");
+
+        // With 1.5x odds multiplier, STRONG_MATCH threshold drops from 15 to 10
+        // So adjustedEV of 12 should be STRONG_MATCH
+        const result = getOddsAdjustedRecommendation(12, 1.5);
+        expect(result).toBe("STRONG_MATCH");
+      });
+
+      test("raises thresholds for unfavorable odds", async () => {
+        const { getOddsAdjustedRecommendation } = await import("../src/bet-comparison");
+
+        // With 0.75x odds multiplier:
+        // - STRONG_MATCH threshold rises from 15 to 20
+        // - MATCH threshold rises from 10 to 13.33
+        // So adjustedEV of 14 should be MATCH (between 13.33 and 20)
+        const result = getOddsAdjustedRecommendation(14, 0.75);
+        expect(result).toBe("MATCH");
+      });
+
+      test("maintains standard thresholds at fair odds", async () => {
+        const { getOddsAdjustedRecommendation } = await import("../src/bet-comparison");
+
+        expect(getOddsAdjustedRecommendation(20, 1.0)).toBe("STRONG_MATCH");
+        expect(getOddsAdjustedRecommendation(12, 1.0)).toBe("MATCH");
+        expect(getOddsAdjustedRecommendation(7, 1.0)).toBe("CONSIDER");
+        expect(getOddsAdjustedRecommendation(3, 1.0)).toBe("LEAN_SKIP");
+        expect(getOddsAdjustedRecommendation(-5, 1.0)).toBe("SKIP");
+      });
+    });
+
+    describe("OddsAdjustedEV interface", () => {
+      test("returns all required fields in result", async () => {
+        const { calculateOddsAdjustedEV } = await import("../src/bet-comparison");
+
+        const ourPortfolio: AggregatedPortfolio = {
+          "0xmarket1": { score: 70, position: 1, confidence: 0.9 }
+        };
+
+        const betPositions: BetPosition[] = [
+          { marketId: "0xmarket1", position: "NO", startingPrice: "0.5", endingPrice: null }
+        ];
+
+        const result = calculateOddsAdjustedEV(ourPortfolio, betPositions, 15000);
+
+        // Verify all OddsAdjustedEV fields are present
+        expect(typeof result.rawEV).toBe("number");
+        expect(typeof result.oddsDecimal).toBe("number");
+        expect(typeof result.oddsMultiplier).toBe("number");
+        expect(typeof result.adjustedEV).toBe("number");
+        expect(typeof result.requiredEdge).toBe("number");
+        expect(["STRONG_MATCH", "MATCH", "CONSIDER", "LEAN_SKIP", "SKIP"]).toContain(result.recommendation);
+      });
+    });
+  });
+
   describe("performance", () => {
     test("compares large portfolios efficiently", async () => {
       const { compareBet } = await import("../src/bet-comparison");
@@ -304,7 +548,7 @@ describe("Bet Comparison", () => {
       // Should process 1000 positions/second minimum (5s max for 5K)
       expect(duration).toBeLessThan(5000);
 
-      console.log(`Compared ${portfolioSize} positions in ${duration}ms`);
+      // Performance: Compared ${portfolioSize} positions in ${duration}ms
     });
   });
 });
