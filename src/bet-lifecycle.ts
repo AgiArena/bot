@@ -32,7 +32,9 @@ export type BetStatus =
  */
 export interface Bet {
   betId: string;
-  creator: string;
+  /** @deprecated Use creatorAddress instead */
+  creator?: string;
+  creatorAddress: string;
   betHash: string;
   portfolioSize: number;
   /** @deprecated Use creatorStake instead. Kept for backwards compatibility. */
@@ -48,6 +50,8 @@ export interface Bet {
   createdAt: string;
   updatedAt: string;
   portfolio?: Portfolio;
+  /** Unix timestamp when bet can be resolved (seconds since epoch) */
+  resolutionDeadline?: number;
 }
 
 /**
@@ -129,6 +133,10 @@ export async function fetchPendingBets(
       headers: {
         "Content-Type": "application/json",
       },
+      // @ts-ignore - Bun-specific option to disable TLS verification
+      tls: {
+        rejectUnauthorized: false,
+      },
     });
 
     if (!response.ok) {
@@ -145,7 +153,7 @@ export async function fetchPendingBets(
         return false;
       }
       // Exclude our own bets
-      if (excludeCreator && bet.creator.toLowerCase() === excludeCreator.toLowerCase()) {
+      if (excludeCreator && bet.creatorAddress.toLowerCase() === excludeCreator.toLowerCase()) {
         return false;
       }
       return true;
@@ -176,6 +184,10 @@ export async function fetchBetDetails(
       headers: {
         "Content-Type": "application/json",
       },
+      // @ts-ignore - Bun-specific option to disable TLS verification
+      tls: {
+        rejectUnauthorized: false,
+      },
     });
 
     if (!response.ok) {
@@ -195,23 +207,71 @@ export async function fetchBetDetails(
 /**
  * Calculate remaining amount that can be matched
  * Uses requiredMatch for asymmetric odds, falls back to amount for legacy bets
+ * Returns amount in USDC base units (6 decimals)
  */
 export function calculateRemainingAmount(bet: Bet): bigint {
   // Use requiredMatch for asymmetric odds, fall back to amount for backwards compatibility
-  const total = BigInt(bet.requiredMatch || bet.amount);
-  const matched = BigInt(bet.matchedAmount);
+  // API returns decimal strings like "2.500000", convert to base units
+  const totalDecimal = bet.requiredMatch || bet.amount;
+  const matchedDecimal = bet.matchedAmount;
+
+  // Parse decimal strings to base units
+  const total = BigInt(parseUSDC(totalDecimal));
+  const matched = BigInt(parseUSDC(matchedDecimal));
   return total - matched;
 }
 
 /**
+ * Minimum time buffer before deadline to consider a bet matchable (10 minutes)
+ */
+const MIN_DEADLINE_BUFFER_SECS = 600;
+
+/**
  * Check if a bet can be matched
+ *
+ * Validates:
+ * - Status is pending or partially_matched
+ * - Has remaining amount to fill
+ * - Resolution deadline hasn't passed
+ * - At least 10 minutes remain before deadline
+ * - Has valid portfolio data (portfolioSize > 0)
  */
 export function canMatchBet(bet: Bet): boolean {
+  // Check status
   if (bet.status !== "pending" && bet.status !== "partially_matched") {
     return false;
   }
+
+  // Check remaining amount
   const remaining = calculateRemainingAmount(bet);
-  return remaining > BigInt(0);
+  if (remaining <= BigInt(0)) {
+    return false;
+  }
+
+  // Check portfolio data exists - don't match bets without proper data
+  if (!hasValidPortfolio(bet)) {
+    logger.warn(`Bet ${bet.betId} rejected: no valid portfolio data`);
+    return false;
+  }
+
+  // Check deadline if present
+  if (bet.resolutionDeadline) {
+    const now = Math.floor(Date.now() / 1000);
+
+    // Deadline already passed
+    if (bet.resolutionDeadline <= now) {
+      logger.warn(`Bet ${bet.betId} has expired (deadline: ${bet.resolutionDeadline}, now: ${now})`);
+      return false;
+    }
+
+    // Too close to expiry (less than 10 minutes)
+    if (bet.resolutionDeadline < now + MIN_DEADLINE_BUFFER_SECS) {
+      logger.warn(`Bet ${bet.betId} too close to deadline (${bet.resolutionDeadline - now}s remaining)`);
+      return false;
+    }
+  }
+
+  return true;
 }
 
 /**
@@ -438,4 +498,95 @@ export function generateBetReference(botAddress: string): string {
   const timestamp = Date.now();
   const random = Math.random().toString(36).slice(2, 8);
   return `bot-${botAddress.slice(2, 8)}-${timestamp}-${random}`;
+}
+
+/**
+ * Upload portfolio JSON to backend after placing a bet
+ *
+ * This stores the full portfolio data so other bots can view it
+ * and the frontend can display market positions.
+ *
+ * @param betId - The bet ID returned from placeBet
+ * @param portfolio - The full portfolio object
+ * @param config - Optional config for backend URL
+ * @returns Success status and message
+ */
+export async function uploadPortfolioToBackend(
+  betId: string,
+  portfolio: Portfolio,
+  config: Partial<LifecycleConfig> = {}
+): Promise<{ success: boolean; message: string }> {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+  const url = `${cfg.backendUrl}/api/bets/${betId}/portfolio`;
+
+  logger.info(`Uploading portfolio for bet ${betId} to ${url}`);
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        portfolioJson: portfolio,
+      }),
+      // @ts-ignore - Bun-specific option to disable TLS verification
+      tls: {
+        rejectUnauthorized: false,
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      logger.error(`Failed to upload portfolio: ${response.status} - ${errorText}`);
+      return {
+        success: false,
+        message: `Upload failed: ${response.status} - ${errorText}`,
+      };
+    }
+
+    const result = await response.json() as { positionsExtracted: number };
+    logger.info(`Portfolio uploaded successfully for bet ${betId}: ${result.positionsExtracted} positions`);
+
+    return {
+      success: true,
+      message: `Uploaded ${result.positionsExtracted} positions`,
+    };
+  } catch (error) {
+    const errorMsg = (error as Error).message;
+    logger.error(`Error uploading portfolio: ${errorMsg}`);
+    return {
+      success: false,
+      message: `Upload error: ${errorMsg}`,
+    };
+  }
+}
+
+/**
+ * Check if a bet has valid portfolio data for matching
+ *
+ * Bots should NOT match bets without portfolio data because:
+ * 1. Can't verify what markets the bet is for
+ * 2. Frontend/keeper can't process the bet properly
+ * 3. Indicates the bet creator didn't properly upload data
+ *
+ * @param bet - The bet to validate
+ * @returns true if portfolio data exists and is valid
+ */
+export function hasValidPortfolio(bet: Bet): boolean {
+  // Check if portfolioSize is greater than 0
+  if (!bet.portfolioSize || bet.portfolioSize === 0) {
+    logger.warn(`Bet ${bet.betId} has no portfolio positions (portfolioSize: ${bet.portfolioSize})`);
+    return false;
+  }
+
+  // If portfolio object is attached, validate it has positions
+  if (bet.portfolio) {
+    if (!bet.portfolio.positions || bet.portfolio.positions.length === 0) {
+      logger.warn(`Bet ${bet.betId} has empty portfolio.positions array`);
+      return false;
+    }
+  }
+
+  return true;
 }

@@ -16,9 +16,11 @@ import {
   createCounterPortfolio,
   calculateFairPrice,
   calculateImpliedRate,
+  calculateOptimalOdds,
   DEFAULT_NEGOTIATION_CONFIG,
   type Portfolio,
   type NegotiationConfig,
+  type OddsRiskProfile,
 } from "./trading-strategy";
 import {
   fetchPendingBets,
@@ -33,6 +35,7 @@ import {
   validatePortfolio,
   formatUSDC,
   calculateRemainingAmount,
+  uploadPortfolioToBackend,
   type BotState,
   type Bet,
   type LifecycleConfig,
@@ -44,6 +47,7 @@ import {
   type RiskProfile,
 } from "./bet-matching";
 import { ResolutionTimerManager, formatTimeRemaining, getTimeRemainingSeconds } from "./resolution-timer";
+import { ChainClient, createChainClientFromEnv, type TransactionResult } from "./chain-client";
 
 /**
  * Trading bot configuration
@@ -98,15 +102,19 @@ const fileLogger = new Logger(logsDir);
  */
 const logger = {
   info: (name: string, msg: string, data?: Record<string, unknown>) => {
+    console.log(`[${name}] ${msg}`, data ? JSON.stringify(data) : "");
     fileLogger.info(`[${name}] ${msg}`, data);
   },
   warn: (name: string, msg: string, data?: Record<string, unknown>) => {
+    console.log(`[${name}] WARN: ${msg}`, data ? JSON.stringify(data) : "");
     fileLogger.warn(`[${name}] ${msg}`, data);
   },
   error: (name: string, msg: string, data?: Record<string, unknown>) => {
+    console.error(`[${name}] ERROR: ${msg}`, data ? JSON.stringify(data) : "");
     fileLogger.error(`[${name}] ${msg}`, data);
   },
   success: (name: string, msg: string, data?: Record<string, unknown>) => {
+    console.log(`[${name}] SUCCESS: ${msg}`, data ? JSON.stringify(data) : "");
     fileLogger.info(`[${name}] [SUCCESS] ${msg}`, data);
   },
 };
@@ -119,6 +127,7 @@ export class TradingBot {
   private state: BotState;
   private markets: MarketScore[] = [];
   private resolutionManager: ResolutionTimerManager;
+  private chainClient: ChainClient | null = null;
   private running: boolean = false;
   private sessionBetCount: number = 0;
   private sessionStartTime: number = Date.now();
@@ -129,6 +138,15 @@ export class TradingBot {
     this.resolutionManager = new ResolutionTimerManager({
       resolutionMinutes: config.resolutionMinutes,
     });
+
+    // Initialize chain client for live trading
+    if (!config.dryRun && config.privateKey) {
+      this.chainClient = new ChainClient({
+        privateKey: config.privateKey,
+        contractAddress: config.contractAddress,
+      });
+      logger.info(config.name, "Chain client initialized for live trading");
+    }
 
     // Set up resolution callback
     this.resolutionManager.setCallback(async (betId) => {
@@ -287,7 +305,7 @@ export class TradingBot {
     const remaining = calculateRemainingAmount(bet);
     const pendingBet = {
       betId: bet.betId,
-      creator: bet.creator,
+      creator: bet.creatorAddress,
       portfolio: bet.portfolio || { positions: [], createdAt: new Date().toISOString() },
       amount: bet.creatorStake || bet.amount,
       remainingAmount: remaining.toString(),
@@ -324,7 +342,9 @@ export class TradingBot {
    */
   private async matchBet(bet: Bet): Promise<void> {
     const available = getAvailableCapital(this.state);
-    const remaining = calculateRemainingAmount(bet).toString();
+    // calculateRemainingAmount returns base units (bigint), convert to USDC decimal for sizing
+    const remainingBaseUnits = calculateRemainingAmount(bet);
+    const remainingUSDC = (Number(remainingBaseUnits) / 1_000_000).toString();
 
     let fillAmount: string;
 
@@ -340,7 +360,7 @@ export class TradingBot {
       fillAmount = calculateOddsAwareFillAmount(
         available,
         riskProfile,
-        remaining,
+        remainingUSDC,
         bet.oddsBps
       );
 
@@ -354,7 +374,8 @@ export class TradingBot {
     } else {
       // Fall back to basic sizing for legacy bets without odds
       const riskPercent = RISK_PROFILE_SIZING[this.config.riskProfile];
-      fillAmount = calculateFillAmount(available, riskPercent, remaining);
+      // calculateFillAmount expects base units, pass remainingBaseUnits as string
+      fillAmount = calculateFillAmount(available, riskPercent, remainingBaseUnits.toString());
     }
 
     if (fillAmount === "0") {
@@ -373,8 +394,23 @@ export class TradingBot {
       // Add to resolution tracking
       this.resolutionManager.addBet(bet.betId);
     } else {
-      // TODO: Actually match the bet on-chain
-      logger.warn(this.config.name, "On-chain matching not implemented yet");
+      // Execute on-chain match
+      if (!this.chainClient) {
+        logger.error(this.config.name, "Chain client not initialized for live trading");
+        return;
+      }
+
+      const fillAmountBigInt = BigInt(fillAmount);
+      const result = await this.chainClient.matchBet(bet.betId, fillAmountBigInt);
+
+      if (result.success) {
+        logger.success(this.config.name, `Matched bet ${bet.betId}! TX: ${result.txHash}`);
+        this.state = updateStateAfterMatch(this.state, bet.betId, fillAmount);
+        this.sessionBetCount++;
+        this.resolutionManager.addBet(bet.betId);
+      } else {
+        logger.error(this.config.name, `Failed to match bet ${bet.betId}: ${result.error}`);
+      }
     }
   }
 
@@ -414,12 +450,45 @@ export class TradingBot {
     const riskPercent = RISK_PROFILE_SIZING[this.config.riskProfile];
     const betAmount = Math.floor(available * riskPercent * 1_000_000);
 
-    if (betAmount < 1_000_000) { // $1 minimum
+    // Minimum 1 cent ($0.01 = 10000 base units)
+    if (betAmount < 10_000) {
       return;
     }
 
+    // Calculate dynamic odds based on portfolio's average market price
+    const avgPrice = portfolio.positions.reduce((sum, p) => {
+      const market = this.markets.find(m => m.marketId === p.marketId);
+      return sum + (market?.priceYes || 0.5);
+    }, 0) / portfolio.positions.length;
+
+    // Determine primary position (most common direction in portfolio)
+    const yesCount = portfolio.positions.filter(p => p.position === "YES").length;
+    const primaryPosition: "YES" | "NO" = yesCount >= portfolio.positions.length / 2 ? "YES" : "NO";
+
+    const oddsBps = calculateOptimalOdds(
+      avgPrice,
+      primaryPosition,
+      this.config.riskProfile as OddsRiskProfile
+    );
+
+    // Calculate resolution deadline based on earliest market end date in portfolio
+    const marketEndDates = portfolio.positions
+      .map(p => {
+        const market = this.markets.find(m => m.marketId === p.marketId);
+        return market?.endDate;
+      })
+      .filter((d): d is string => d !== null && d !== undefined)
+      .map(d => new Date(d).getTime() / 1000);
+
+    // Use earliest market end, or 24 hours from now if no end dates available
+    const defaultDeadline = Math.floor(Date.now() / 1000) + 24 * 60 * 60;
+    const resolutionDeadline = marketEndDates.length > 0
+      ? Math.min(...marketEndDates)
+      : defaultDeadline;
+
     logger.info(this.config.name, `Placing bet with ${formatUSDC(betAmount.toString())} USDC`);
     logger.info(this.config.name, `Portfolio: ${portfolio.positions.length} positions`);
+    logger.info(this.config.name, `Odds: ${(oddsBps / 10000).toFixed(2)}x, Deadline: ${new Date(resolutionDeadline * 1000).toISOString()}`);
 
     if (this.config.dryRun) {
       logger.info(this.config.name, "[DRY RUN] Would place bet");
@@ -428,8 +497,38 @@ export class TradingBot {
       this.state = updateStateAfterPlace(this.state, fakeBetId, betAmount.toString());
       this.sessionBetCount++;
     } else {
-      // TODO: Actually place the bet on-chain
-      logger.warn(this.config.name, "On-chain bet placement not implemented yet");
+      // Execute on-chain bet placement
+      if (!this.chainClient) {
+        logger.error(this.config.name, "Chain client not initialized for live trading");
+        return;
+      }
+
+      const result = await this.chainClient.placeBet(
+        portfolio,
+        BigInt(betAmount),
+        oddsBps,
+        resolutionDeadline
+      );
+
+      if (result.success) {
+        const betId = result.betId || `placed-${Date.now()}`;
+        logger.success(this.config.name, `Placed bet ${betId}! TX: ${result.txHash}`);
+        this.state = updateStateAfterPlace(this.state, betId, betAmount.toString());
+        this.sessionBetCount++;
+
+        // Upload portfolio data to backend so other bots can see it
+        // and frontend can display market positions
+        const backendUrl = process.env.BACKEND_URL || "http://localhost:3001";
+        const uploadResult = await uploadPortfolioToBackend(betId, portfolio, { backendUrl });
+        if (uploadResult.success) {
+          logger.info(this.config.name, `Portfolio uploaded for bet ${betId}: ${uploadResult.message}`);
+        } else {
+          logger.warn(this.config.name, `Portfolio upload failed for bet ${betId}: ${uploadResult.message}`);
+          // Note: Bet is still placed on-chain, just without backend portfolio data
+        }
+      } else {
+        logger.error(this.config.name, `Failed to place bet: ${result.error}`);
+      }
     }
   }
 
