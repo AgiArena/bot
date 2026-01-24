@@ -347,3 +347,59 @@ export function serializePortfolio(portfolio: Portfolio): string {
 export function parsePortfolio(json: string): Portfolio {
   return JSON.parse(json) as Portfolio;
 }
+
+/**
+ * Risk profile for odds calculation
+ */
+export type OddsRiskProfile = "conservative" | "balanced" | "aggressive";
+
+/**
+ * Calculate optimal odds based on market prices and risk profile
+ *
+ * The odds represent the multiplier for the creator's stake:
+ * - If creator stakes $100 at 2.00x odds, matcher stakes $50
+ * - Creator wins: gets $150 (their $100 + matcher's $50)
+ * - Matcher wins: gets $150 (their $50 + creator's $100) = 3x return
+ *
+ * @param marketPrice - Average market price (0.0 to 1.0) representing YES probability
+ * @param position - Whether creator is betting YES or NO
+ * @param riskProfile - Risk tolerance level
+ * @returns oddsBps - Odds in basis points (10000 = 1.00x)
+ */
+export function calculateOptimalOdds(
+  marketPrice: number,
+  position: "YES" | "NO",
+  riskProfile: OddsRiskProfile = "balanced"
+): number {
+  // Convert market price to implied probability for the creator's position
+  // If betting YES on a 70% YES market, creator's implied prob is 70%
+  // If betting NO on a 70% YES market, creator's implied prob is 30%
+  const impliedProb = position === "YES" ? marketPrice : 1 - marketPrice;
+
+  // Clamp implied probability to avoid division issues
+  const clampedProb = Math.max(0.1, Math.min(0.9, impliedProb));
+
+  // Base odds from implied probability
+  // Higher implied prob -> higher odds (creator expects to win more often)
+  // impliedProb = 0.7 -> base odds = 1 / (1 - 0.7) = 3.33x
+  // impliedProb = 0.5 -> base odds = 1 / (1 - 0.5) = 2.0x
+  // impliedProb = 0.3 -> base odds = 1 / (1 - 0.3) = 1.43x
+  const baseOddsMultiplier = 1 / (1 - clampedProb);
+  let baseOddsBps = Math.round(baseOddsMultiplier * 10000);
+
+  // Apply risk adjustment
+  // Conservative: Offer slightly worse odds for creator (lower oddsBps = higher matcher return)
+  // Aggressive: Offer slightly better odds for creator (higher oddsBps = lower matcher return)
+  const adjustments: Record<OddsRiskProfile, number> = {
+    conservative: 0.85, // Offer 15% worse odds (more attractive to matchers)
+    balanced: 1.0,      // Fair odds
+    aggressive: 1.15,   // Offer 15% better odds (less attractive to matchers)
+  };
+
+  baseOddsBps = Math.round(baseOddsBps * adjustments[riskProfile]);
+
+  // Clamp to valid range
+  // Min: 5000 (0.5x) - creator risks 2x what they could win
+  // Max: 30000 (3.0x) - creator could win 3x their stake
+  return Math.max(5000, Math.min(30000, baseOddsBps));
+}

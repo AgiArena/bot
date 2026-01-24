@@ -11,9 +11,14 @@
 import { join } from "path";
 import { Logger } from "./logger";
 
-// Initialize logger for this module
+// Initialize logger for this module with console output
 const logsDir = process.env.AGENT_LOGS_DIR || join(process.cwd(), "agent");
-const logger = new Logger(logsDir);
+const fileLogger = new Logger(logsDir);
+const logger = {
+  info: (msg: string) => { console.log(`[MarketSelector] ${msg}`); fileLogger.info(msg); },
+  warn: (msg: string) => { console.log(`[MarketSelector] WARN: ${msg}`); fileLogger.warn(msg); },
+  error: (msg: string) => { console.error(`[MarketSelector] ERROR: ${msg}`); fileLogger.error(msg); },
+};
 
 /**
  * Market data from backend API
@@ -54,6 +59,8 @@ export interface MarketScore {
   priceNo: number;
   score: number;
   reasons: string[];
+  /** Market end date (ISO string), used for resolution deadline calculation */
+  endDate: string | null;
 }
 
 /**
@@ -91,10 +98,15 @@ export async function fetchMarkets(
   logger.info(`Fetching markets from ${url.toString()}`);
 
   try {
+    // Use Bun's fetch with TLS verification disabled for self-signed certs
     const response = await fetch(url.toString(), {
       method: "GET",
       headers: {
         "Content-Type": "application/json",
+      },
+      // @ts-ignore - Bun-specific option to disable TLS verification
+      tls: {
+        rejectUnauthorized: false,
       },
     });
 
@@ -103,10 +115,24 @@ export async function fetchMarkets(
       throw new Error(`Failed to fetch markets: ${response.status} - ${errorText}`);
     }
 
-    const data: MarketsResponse = await response.json();
+    const data = await response.json();
     logger.info(`Fetched ${data.markets.length} markets (total: ${data.pagination.total})`);
 
-    return data.markets;
+    // Parse string values to numbers (API returns strings for numeric fields)
+    const markets: Market[] = data.markets.map((m: Record<string, unknown>) => ({
+      marketId: String(m.marketId || ""),
+      question: String(m.question || ""),
+      priceYes: m.priceYes != null ? parseFloat(String(m.priceYes)) : null,
+      priceNo: m.priceNo != null ? parseFloat(String(m.priceNo)) : null,
+      volume: parseFloat(String(m.volume || "0")),
+      liquidity: parseFloat(String(m.liquidity || "0")),
+      isActive: Boolean(m.isActive),
+      endDate: m.endDate ? String(m.endDate) : null,
+      category: m.category ? String(m.category) : null,
+      lastUpdated: String(m.lastUpdated || new Date().toISOString()),
+    }));
+
+    return markets;
   } catch (error) {
     logger.error(`Market fetch error: ${error}`);
     throw error;
@@ -116,7 +142,7 @@ export async function fetchMarkets(
 /**
  * Filter markets based on trading criteria
  *
- * AC2: volume > 1000, active markets, not expired
+ * AC2: volume > 1000, active markets, not expired, not closing soon
  */
 export function filterMarkets(
   markets: Market[],
@@ -124,29 +150,32 @@ export function filterMarkets(
 ): Market[] {
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const now = new Date();
+  const minEndTime = new Date(now.getTime() + 10 * 60 * 1000); // 10 minutes from now
 
   return markets.filter((market) => {
-    // Must be active
+    // Must be active and not closed
     if (!market.isActive) {
       return false;
     }
 
-    // Volume filter (AC2)
+    // Volume filter (AC2) - minimum $1000 volume
     if (market.volume < cfg.minVolume) {
       return false;
     }
 
-    // Not expired
+    // Not expired and not closing within 10 minutes
     if (market.endDate) {
       const endDate = new Date(market.endDate);
-      if (endDate <= now) {
-        return false;
+      if (endDate <= minEndTime) {
+        return false; // Expired or closing too soon
       }
     }
 
-    // Must have valid prices
-    if (market.priceYes === null || market.priceNo === null) {
-      return false;
+    // Must have valid prices (odds between 0.01 and 0.99)
+    const priceYes = market.priceYes ?? 0;
+    const priceNo = market.priceNo ?? 0;
+    if (priceYes <= 0.01 || priceYes >= 0.99) {
+      return false; // Market essentially resolved (>99% or <1%)
     }
 
     return true;
@@ -233,6 +262,7 @@ export function scoreMarket(market: Market): MarketScore {
     priceNo,
     score,
     reasons,
+    endDate: market.endDate,
   };
 }
 
