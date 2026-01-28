@@ -12,6 +12,7 @@ export type LogLevel = "INFO" | "WARN" | "ERROR" | "DEBUG";
 export class Logger {
   private readonly logPath: string;
   private writeQueue: Promise<void> = Promise.resolve();
+  private lastErrorTime: number | null = null;
 
   constructor(logsDir: string) {
     this.logPath = join(logsDir, "agent.log");
@@ -44,8 +45,14 @@ export class Logger {
       const file = Bun.file(this.logPath);
       const existing = await file.exists() ? await file.text() : "";
       await Bun.write(this.logPath, existing + formatted);
-    }).catch(() => {
-      // Silently fail logging errors to avoid cascading failures
+    }).catch((error) => {
+      // Log to stderr on logger failure to avoid silent failures
+      // Only log once per minute to avoid log spam
+      const now = Date.now();
+      if (!this.lastErrorTime || now - this.lastErrorTime > 60_000) {
+        this.lastErrorTime = now;
+        console.error(`[Logger] Failed to write log: ${error?.message || error}`);
+      }
     });
   }
 

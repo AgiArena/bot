@@ -1,6 +1,47 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname } from "path";
 import type { Config, AgentConfig, ClaudeSubscriptionTier } from "./types";
+import { loadRateLimitsFromEnv, type RateLimits, DEFAULT_RATE_LIMITS } from "./rate-limiter";
+import { loadCancellationConfigFromEnv, type CancellationConfig, DEFAULT_CANCELLATION_CONFIG } from "./cancellation";
+
+/**
+ * Extended configuration including rate limits and cancellation settings
+ */
+export interface ExtendedConfig extends Config {
+  rateLimits: RateLimits;
+  cancellation: CancellationConfig;
+}
+
+/**
+ * Load extended configuration including env-based rate limits and cancellation
+ */
+export function loadExtendedConfig(configPath: string): ExtendedConfig {
+  const baseConfig = loadConfig(configPath);
+  return {
+    ...baseConfig,
+    rateLimits: loadRateLimitsFromEnv(),
+    cancellation: loadCancellationConfigFromEnv(),
+  };
+}
+
+/**
+ * Get safe extended config for logging (without sensitive data)
+ */
+export function getSafeExtendedConfig(config: ExtendedConfig): {
+  walletAddress: string;
+  capital: number;
+  riskProfile: string;
+  rateLimits: RateLimits;
+  cancellation: CancellationConfig;
+} {
+  return {
+    walletAddress: `${config.agent.walletAddress.slice(0, 6)}...${config.agent.walletAddress.slice(-4)}`,
+    capital: config.agent.capital,
+    riskProfile: config.agent.riskProfile,
+    rateLimits: config.rateLimits,
+    cancellation: config.cancellation,
+  };
+}
 
 /**
  * Validates an Ethereum address format
@@ -99,6 +140,10 @@ export function loadConfig(configPath: string): Config {
   // Get private key from environment variable (secure)
   const privateKey = getPrivateKey();
 
+  // Epic 8: Load category betting config from env vars
+  const tradeCategories = process.env.TRADE_CATEGORIES?.split(',').filter(c => c.trim()) || ['crypto'];
+  const tradeListSize = (process.env.TRADE_LIST_SIZE || '10K') as '1K' | '10K' | '100K';
+
   // Apply defaults for optional fields (Pro tier defaults for backward compatibility)
   const config: Config = {
     agent: {
@@ -108,7 +153,9 @@ export function loadConfig(configPath: string): Config {
       riskProfile: (parsed.agent as AgentConfig).riskProfile || "balanced",
       researchTerminals: (parsed.agent as AgentConfig).researchTerminals || 5,
       researchInterval: (parsed.agent as AgentConfig).researchInterval || 30,
-      claudeSubscription: (parsed.agent as AgentConfig).claudeSubscription || "pro"
+      claudeSubscription: (parsed.agent as AgentConfig).claudeSubscription || "pro",
+      tradeCategories,
+      tradeListSize,
     }
   };
 

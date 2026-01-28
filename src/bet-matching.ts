@@ -1,5 +1,10 @@
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, appendFileSync } from "fs";
-import { dirname } from "path";
+import { dirname, join } from "path";
+import { Logger } from "./logger";
+
+// Initialize logger for this module (file-based, respects log levels)
+const logsDir = process.env.AGENT_LOGS_DIR || join(process.cwd(), "agent");
+const logger = new Logger(logsDir);
 
 /**
  * Record of a matched bet for state tracking
@@ -153,17 +158,19 @@ export function calculateOddsFavorability(oddsBps: number): OddsFavorabilityResu
  *
  * Adjustment is clamped between 0.5x and 1.5x of base sizing.
  *
- * @param capital - Total capital in USDC
+ * @param capital - Total capital in human-readable units (e.g., 100 tokens)
  * @param riskProfile - Risk profile (conservative, balanced, aggressive)
- * @param betRemaining - Remaining bet amount as decimal string
+ * @param betRemaining - Remaining bet amount as decimal string (human-readable)
  * @param oddsBps - Odds in basis points (10000 = 1.0x, 20000 = 2.0x)
- * @returns Fill amount in USDC base units (6 decimals)
+ * @param decimals - Number of decimals for the collateral token (6 for USDC, 18 for WIND)
+ * @returns Fill amount in base units
  */
 export function calculateOddsAwareFillAmount(
   capital: number,
   riskProfile: RiskProfile,
   betRemaining: string,
-  oddsBps: number
+  oddsBps: number,
+  decimals: number = 6
 ): string {
   const baseSizing = RISK_PROFILE_SIZING[riskProfile];
 
@@ -189,15 +196,34 @@ export function calculateOddsAwareFillAmount(
   // Take minimum of target bet and remaining
   const fillAmount = Math.min(targetBet, remaining);
 
-  // Convert to base units (6 decimals) and ensure whole number
-  const fillAmountBaseUnits = Math.floor(fillAmount * 1_000_000);
+  logger.debug("Bet sizing calculation", { capital, targetBet, remaining, fillAmount });
 
-  // Enforce minimum bet amount (1 cent = 10,000 base units)
-  if (fillAmountBaseUnits < MIN_BET_AMOUNT) {
+  // Convert to base units using the specified decimals
+  const multiplier = BigInt(10) ** BigInt(decimals);
+  const fillAmountBaseUnits = BigInt(Math.floor(fillAmount * Number(multiplier)));
+
+  logger.debug("Base units conversion", { decimals, multiplier: multiplier.toString(), fillAmountBaseUnits: fillAmountBaseUnits.toString() });
+
+  // Minimum bet in base units (0.01 tokens)
+  const minBetBaseUnits = multiplier / BigInt(100);
+
+  // Calculate remaining in base units
+  const remainingBaseUnits = BigInt(Math.floor(remaining * Number(multiplier)));
+  const isFillingEntireRemaining = fillAmountBaseUnits >= remainingBaseUnits && remainingBaseUnits > BigInt(0);
+
+  logger.debug("Fill size check", {
+    minBetBaseUnits: minBetBaseUnits.toString(),
+    fillAmountBaseUnits: fillAmountBaseUnits.toString(),
+    tooSmall: fillAmountBaseUnits < minBetBaseUnits,
+  });
+
+  if (fillAmountBaseUnits < minBetBaseUnits && !isFillingEntireRemaining) {
+    logger.debug("Returning 0 because fill too small");
     return "0";
   }
 
-  return fillAmountBaseUnits.toString();
+  // For small fills, ensure we fill at least what's remaining
+  return isFillingEntireRemaining ? remainingBaseUnits.toString() : fillAmountBaseUnits.toString();
 }
 
 /**
@@ -289,10 +315,34 @@ export function logOddsSizingDecision(
 }
 
 /**
- * Minimum bet amount in USDC base units
- * 1 cent = $0.01 = 10,000 base units (USDC has 6 decimals)
+ * Get collateral decimals from environment (default: 6 for USDC, 18 for WIND)
  */
-export const MIN_BET_AMOUNT = 10_000;
+function getCollateralDecimals(): number {
+  const envValue = process.env.COLLATERAL_DECIMALS;
+  if (envValue) {
+    const parsed = parseInt(envValue, 10);
+    if (!isNaN(parsed) && parsed > 0 && parsed <= 18) {
+      return parsed;
+    }
+  }
+  return 6;
+}
+
+/**
+ * Get multiplier for collateral token
+ */
+function getCollateralMultiplier(): bigint {
+  return BigInt(10) ** BigInt(getCollateralDecimals());
+}
+
+/**
+ * Minimum bet amount in base units
+ * 0.01 tokens = 10^(decimals-2) base units
+ */
+export function getMinBetAmount(): bigint {
+  const decimals = getCollateralDecimals();
+  return BigInt(10) ** BigInt(decimals - 2);
+}
 
 /**
  * Error codes for bet matching
@@ -423,8 +473,8 @@ export function logTransaction(
 
 /**
  * Calculate fill amount based on risk profile and capital
- * Returns amount in USDC base units (6 decimals)
- * Enforces minimum bet of 1 cent ($0.01 = 10,000 base units)
+ * Returns amount in base units (uses COLLATERAL_DECIMALS from env)
+ * Enforces minimum bet of 0.01 tokens
  */
 export function calculateFillAmount(
   capital: number,
@@ -432,8 +482,10 @@ export function calculateFillAmount(
   betRemaining: string
 ): string {
   const sizing = RISK_PROFILE_SIZING[riskProfile];
+  const multiplier = Number(getCollateralMultiplier());
+  const minBetAmount = Number(getMinBetAmount());
 
-  // Calculate min and max bet size in USDC
+  // Calculate min and max bet size in tokens
   const minBet = capital * sizing.min;
   const maxBet = capital * sizing.max;
 
@@ -446,47 +498,56 @@ export function calculateFillAmount(
   // Take minimum of target bet and remaining
   const fillAmount = Math.min(targetBet, remaining);
 
-  // Convert to base units (6 decimals) and ensure whole number
-  const fillAmountBaseUnits = Math.floor(fillAmount * 1_000_000);
+  // Convert to base units and ensure whole number
+  const fillAmountBaseUnits = Math.floor(fillAmount * multiplier);
 
-  // Enforce minimum bet amount (1 cent = 10,000 base units)
-  if (fillAmountBaseUnits < MIN_BET_AMOUNT) {
+  // Enforce minimum bet amount
+  // BUT: allow filling if we're filling the entire remaining amount (for small bets)
+  const remainingBaseUnits = Math.floor(remaining * multiplier);
+  const isFillingEntireRemaining = fillAmountBaseUnits >= remainingBaseUnits && remainingBaseUnits > 0;
+
+  if (fillAmountBaseUnits < minBetAmount && !isFillingEntireRemaining) {
     return "0"; // Return 0 to signal below minimum - caller should skip this bet
   }
 
-  return fillAmountBaseUnits.toString();
+  // For small fills, ensure we fill at least what's remaining
+  return isFillingEntireRemaining ? remainingBaseUnits.toString() : fillAmountBaseUnits.toString();
 }
 
 /**
  * Validate that a bet amount meets the minimum threshold
- * Returns true if amount is at least 1 cent ($0.01)
- * Uses BigInt for safe comparison of large USDC amounts
+ * Returns true if amount is at least 0.01 tokens
+ * Uses BigInt for safe comparison
  */
 export function validateMinimumBet(amountBaseUnits: string | number | bigint): boolean {
   const amount = BigInt(amountBaseUnits);
-  return amount >= BigInt(MIN_BET_AMOUNT);
+  return amount >= getMinBetAmount();
 }
 
 /**
- * Format USDC amount from base units to decimal string
- * e.g., "1000000" -> "1.000000"
+ * Format collateral amount from base units to decimal string
+ * Uses COLLATERAL_DECIMALS from env
  */
 export function formatUSDCAmount(baseUnits: string): string {
+  const decimals = getCollateralDecimals();
+  const multiplier = getCollateralMultiplier();
   const amount = BigInt(baseUnits);
-  const whole = amount / BigInt(1_000_000);
-  const fraction = amount % BigInt(1_000_000);
-  return `${whole}.${fraction.toString().padStart(6, "0")}`;
+  const whole = amount / multiplier;
+  const fraction = amount % multiplier;
+  return `${whole}.${fraction.toString().padStart(decimals, "0")}`;
 }
 
 /**
- * Parse USDC amount from decimal string to base units
- * e.g., "1.5" -> "1500000"
+ * Parse collateral amount from decimal string to base units
+ * Uses COLLATERAL_DECIMALS from env
  */
 export function parseUSDCAmount(decimal: string): string {
+  const decimals = getCollateralDecimals();
+  const multiplier = getCollateralMultiplier();
   const parts = decimal.split(".");
   const whole = BigInt(parts[0]);
-  const fraction = parts[1] ? parts[1].padEnd(6, "0").slice(0, 6) : "000000";
-  return (whole * BigInt(1_000_000) + BigInt(fraction)).toString();
+  const fraction = parts[1] ? parts[1].padEnd(decimals, "0").slice(0, decimals) : "0".repeat(decimals);
+  return (whole * multiplier + BigInt(fraction)).toString();
 }
 
 /**
@@ -550,3 +611,125 @@ export function createErrorResult(
     details
   };
 }
+
+// ============================================================================
+// Epic 8: Category-Based Matching Constraints
+// ============================================================================
+
+import type { TradeListSize, Trade } from './types';
+
+/**
+ * Extended bet details with Epic 8 fields
+ */
+export interface BetDetailsEpic8 extends BetDetails {
+  snapshotId?: string;
+  categoryId?: string;
+  listSize?: string;
+}
+
+/**
+ * Bot's current category configuration
+ */
+export interface BotCategoryConfig {
+  currentSnapshotId: string;
+  categoryId: string;
+  listSize: TradeListSize;
+}
+
+/**
+ * Check if a bet matches the bot's category configuration
+ *
+ * Epic 8: Bots can only match bets with same snapshot + category + listSize
+ *
+ * @param bet - The bet to check
+ * @param botConfig - Bot's category configuration
+ * @returns true if bet can be matched
+ */
+export function matchesCategoryConfig(bet: BetDetailsEpic8, botConfig: BotCategoryConfig): boolean {
+  if (!bet.snapshotId || !bet.categoryId || !bet.listSize) {
+    // Legacy bet without Epic 8 fields - skip under new rules
+    return false;
+  }
+
+  return (
+    bet.snapshotId === botConfig.currentSnapshotId &&
+    bet.categoryId === botConfig.categoryId &&
+    bet.listSize === botConfig.listSize
+  );
+}
+
+/**
+ * Filter bets to only those matching bot's category config
+ *
+ * @param bets - All pending bets
+ * @param botConfig - Bot's category configuration
+ * @returns Bets matching the configuration
+ */
+export function filterBetsByCategory(
+  bets: BetDetailsEpic8[],
+  botConfig: BotCategoryConfig
+): BetDetailsEpic8[] {
+  return bets.filter(bet => matchesCategoryConfig(bet, botConfig));
+}
+
+/**
+ * Result of counterparty trade verification
+ */
+export interface TradeVerificationResult {
+  valid: boolean;
+  trades: Trade[];
+  reason?: string;
+}
+
+/**
+ * Check if counterparty's entry prices are reasonable
+ *
+ * Epic 8: Before matching, verify the counterparty's entry prices
+ * are within tolerance of current market prices.
+ *
+ * @param trades - Counterparty's trades
+ * @param currentPrices - Map of ticker -> current price
+ * @param tolerance - Max allowed price deviation (default 5%)
+ * @returns Verification result
+ */
+export function verifyTradeEntryPrices(
+  trades: Trade[],
+  currentPrices: Map<string, number>,
+  tolerance: number = 0.05
+): TradeVerificationResult {
+  if (trades.length === 0) {
+    return { valid: false, trades: [], reason: 'No trades found' };
+  }
+
+  for (const trade of trades) {
+    const currentPrice = currentPrices.get(trade.ticker);
+    if (currentPrice === undefined) {
+      // Can't verify this trade - might be acceptable for illiquid markets
+      continue;
+    }
+
+    const deviation = Math.abs(trade.entryPrice - currentPrice) / currentPrice;
+    if (deviation > tolerance) {
+      return {
+        valid: false,
+        trades,
+        reason: `Trade ${trade.ticker}: entry price ${trade.entryPrice} deviates ${(deviation * 100).toFixed(1)}% from current ${currentPrice}`,
+      };
+    }
+  }
+
+  return { valid: true, trades };
+}
+
+/**
+ * Error codes specific to Epic 8 matching
+ */
+export const EPIC8_ERROR_CODES = {
+  SNAPSHOT_MISMATCH: "SNAPSHOT_MISMATCH",
+  CATEGORY_MISMATCH: "CATEGORY_MISMATCH",
+  LIST_SIZE_MISMATCH: "LIST_SIZE_MISMATCH",
+  TRADES_NOT_FOUND: "TRADES_NOT_FOUND",
+  PRICE_DEVIATION: "PRICE_DEVIATION",
+} as const;
+
+export type Epic8ErrorCode = typeof EPIC8_ERROR_CODES[keyof typeof EPIC8_ERROR_CODES];

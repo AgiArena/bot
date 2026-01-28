@@ -28,7 +28,15 @@ import {
   type RiskProfile,
   type CounterScoresPayload
 } from "../bet-matching";
-import type { AggregatedPortfolio } from "../score-aggregation";
+
+/**
+ * Aggregated portfolio scores (simplified definition)
+ */
+type AggregatedPortfolio = Record<string, {
+  score: number;
+  position: number;
+  confidence?: number;
+}>;
 
 // Retry configuration
 const MAX_RETRIES = parseInt(process.env.API_MAX_RETRIES || "3", 10);

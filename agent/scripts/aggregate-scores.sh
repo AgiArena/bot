@@ -37,3 +37,6 @@ cd "${BOT_DIR}"
 bun run src/cli/aggregate-scores-cli.ts "${RESEARCH_DIR}" "${PORTFOLIO_SCORES}" "${MY_PORTFOLIO}"
 
 exit 0
+
+
+  

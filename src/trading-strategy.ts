@@ -11,7 +11,101 @@
  * AC: 3, 4 - AI Price Negotiation
  */
 
-import type { MarketScore } from "./market-selector";
+import type { MarketScore, CryptoMarketScore } from "./market-selector";
+import { fetchWithTls } from "./fetch-utils";
+import { keccak256, toUtf8Bytes, concat } from "ethers";
+import { encodePositionBitmap, computeBitmapHash } from "./bitmap-utils";
+
+/**
+ * Data source for market prices
+ * Expanded to include economic data sources (BLS, FRED, ECB) and DeFi
+ */
+export type DataSource =
+  | "polymarket"
+  | "coingecko"
+  | "stocks"
+  | "openmeteo"
+  | "bls"    // Bureau of Labor Statistics - employment/inflation
+  | "fred"   // Federal Reserve Economic Data - rates/treasury
+  | "ecb"    // European Central Bank - euro macro
+  | "defi";  // DeFi protocols - TVL/volumes
+
+/**
+ * Resolution method for bets
+ */
+export type ResolutionMethod = "keeper" | "deterministic";
+
+/**
+ * Encode a market ID with source and resolution method prefix
+ *
+ * Format: {source}:{resolution}:{raw_id}
+ *
+ * Examples:
+ * - encodeMarketId("polymarket", "keeper", "0x123") -> "polymarket:keeper:0x123"
+ * - encodeMarketId("coingecko", "deterministic", "bitcoin") -> "coingecko:deterministic:bitcoin"
+ */
+export function encodeMarketId(
+  source: DataSource,
+  method: ResolutionMethod,
+  rawId: string
+): string {
+  return `${source}:${method}:${rawId}`;
+}
+
+/**
+ * Valid data sources for parsing
+ */
+const VALID_SOURCES: readonly DataSource[] = [
+  "polymarket",
+  "coingecko",
+  "stocks",
+  "openmeteo",
+  "bls",
+  "fred",
+  "ecb",
+  "defi",
+] as const;
+
+/**
+ * Parse a market ID into its components
+ *
+ * Supports:
+ * - New format: {source}:{resolution}:{raw_id}
+ * - Legacy format: treated as polymarket:keeper:{raw_id}
+ */
+export function parseMarketId(marketId: string): {
+  dataSource: DataSource;
+  resolutionMethod: ResolutionMethod;
+  rawId: string;
+} {
+  const parts = marketId.split(":");
+
+  if (parts.length >= 3) {
+    // Check if the first part is a valid source
+    const sourceStr = parts[0].toLowerCase();
+    const dataSource: DataSource = VALID_SOURCES.includes(sourceStr as DataSource)
+      ? (sourceStr as DataSource)
+      : "polymarket";
+    const resolutionMethod = parts[1] === "deterministic" ? "deterministic" : "keeper";
+    const rawId = parts.slice(2).join(":");
+
+    return { dataSource, resolutionMethod, rawId };
+  }
+
+  // Legacy format
+  return {
+    dataSource: "polymarket",
+    resolutionMethod: "keeper",
+    rawId: marketId,
+  };
+}
+
+/**
+ * Check if a data source is economic (macro) data
+ */
+export function isEconomicSource(source: DataSource): boolean {
+  return source === "bls" || source === "fred" || source === "ecb";
+}
 
 /**
  * Negotiation thresholds in basis points (100 bps = 1%)
@@ -256,7 +350,8 @@ export function generateCounterRate(
 /**
  * Create a random portfolio from selected markets
  *
- * Used for initial bet placement by bots
+ * Used for initial bet placement by bots.
+ * Now encodes market IDs with source and resolution method.
  */
 export function createRandomPortfolio(
   markets: MarketScore[],
@@ -267,15 +362,67 @@ export function createRandomPortfolio(
   const selected = shuffled.slice(0, Math.min(positionCount, markets.length));
 
   // Create positions with random YES/NO and equal weights
+  // Use encoded market IDs for Polymarket positions
   const weight = 1 / selected.length;
   const positions: PortfolioPosition[] = selected.map((market) => ({
-    marketId: market.marketId,
+    marketId: encodeMarketId("polymarket", "keeper", market.marketId),
     position: Math.random() > 0.5 ? "YES" : "NO",
     weight,
   }));
 
   return {
     positions,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Create a mixed portfolio from both Polymarket and CoinGecko markets
+ *
+ * Allows diversification across prediction markets and crypto prices.
+ * CoinGecko positions use deterministic resolution.
+ */
+export function createMixedPortfolio(
+  polymarketMarkets: MarketScore[],
+  cryptoMarkets: CryptoMarketScore[],
+  positionCount: number = 5,
+  cryptoRatio: number = 0.2 // 20% crypto by default
+): Portfolio {
+  const cryptoCount = Math.floor(positionCount * cryptoRatio);
+  const polymarketCount = positionCount - cryptoCount;
+
+  // Select random Polymarket markets
+  const shuffledPoly = [...polymarketMarkets].sort(() => Math.random() - 0.5);
+  const selectedPoly = shuffledPoly.slice(0, Math.min(polymarketCount, polymarketMarkets.length));
+
+  // Select random crypto markets
+  const shuffledCrypto = [...cryptoMarkets].sort(() => Math.random() - 0.5);
+  const selectedCrypto = shuffledCrypto.slice(0, Math.min(cryptoCount, cryptoMarkets.length));
+
+  const totalPositions = selectedPoly.length + selectedCrypto.length;
+  if (totalPositions === 0) {
+    return { positions: [], createdAt: new Date().toISOString() };
+  }
+
+  const weight = 1 / totalPositions;
+
+  // Create Polymarket positions (keeper resolution)
+  const polyPositions: PortfolioPosition[] = selectedPoly.map((market) => ({
+    marketId: encodeMarketId("polymarket", "keeper", market.marketId),
+    position: Math.random() > 0.5 ? "YES" : "NO",
+    weight,
+  }));
+
+  // Create crypto positions (deterministic resolution)
+  // YES = LONG (price goes up), NO = SHORT (price goes down)
+  const cryptoPositions: PortfolioPosition[] = selectedCrypto.map((market) => ({
+    marketId: encodeMarketId("coingecko", "deterministic", market.coinId),
+    position: Math.random() > 0.5 ? "YES" : "NO",
+    weight,
+  }));
+
+  return {
+    positions: [...polyPositions, ...cryptoPositions],
     createdAt: new Date().toISOString(),
   };
 }
@@ -301,6 +448,10 @@ export function createCounterPortfolio(portfolio: Portfolio): Portfolio {
 /**
  * Calculate expected portfolio score
  *
+ * @deprecated Epic 8: This function is deprecated. Resolution now uses
+ * majority-wins (trades won > 50%) instead of score calculation.
+ * Kept for backward compatibility only.
+ *
  * Used to determine which side wins at resolution
  */
 export function calculatePortfolioScore(
@@ -325,13 +476,13 @@ export function calculatePortfolioScore(
 
 /**
  * Calculate portfolio hash for on-chain commitment
+ *
+ * Story 9.2: Updated to use keccak256 from ethers.js to match backend.
+ * The old sha3-256 (Bun.CryptoHasher) produces different hashes than keccak256.
  */
 export function calculatePortfolioHash(portfolio: Portfolio): string {
   const json = JSON.stringify(portfolio);
-  // Use Bun's native crypto for keccak256
-  const hash = new Bun.CryptoHasher("sha3-256");
-  hash.update(json);
-  return "0x" + hash.digest("hex");
+  return keccak256(toUtf8Bytes(json));
 }
 
 /**
@@ -402,4 +553,185 @@ export function calculateOptimalOdds(
   // Min: 5000 (0.5x) - creator risks 2x what they could win
   // Max: 30000 (3.0x) - creator could win 3x their stake
   return Math.max(5000, Math.min(30000, baseOddsBps));
+}
+
+// ============================================================================
+// Epic 8: Trade-Based Betting (Majority-Wins Resolution)
+// ============================================================================
+
+import type { Trade, TradeList, TradeListSize } from './types';
+
+/**
+ * Trade position for Epic 8 bets
+ */
+export type TradePosition = 'LONG' | 'SHORT' | 'YES' | 'NO';
+
+/**
+ * Fetch current price for a ticker from backend
+ *
+ * @param source - Data source ('coingecko', 'polymarket', 'gamma')
+ * @param ticker - Ticker symbol or market ID
+ * @param backendUrl - Backend API URL
+ * @returns Current price
+ */
+export async function fetchCurrentPrice(
+  source: string,
+  ticker: string,
+  backendUrl: string
+): Promise<number> {
+  const url = `${backendUrl}/api/prices/${source}/${encodeURIComponent(ticker)}`;
+
+  const response = await fetchWithTls(url, {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch price for ${ticker}: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.price;
+}
+
+/**
+ * Select random positions for trades
+ *
+ * @param trades - Trade list from snapshot
+ * @returns Trades with positions assigned
+ */
+export function assignRandomPositions(trades: Trade[]): Trade[] {
+  return trades.map(trade => ({
+    ...trade,
+    position: (trade.source === 'coingecko' || trade.source === 'stocks'
+      ? (Math.random() > 0.5 ? 'LONG' : 'SHORT')
+      : (Math.random() > 0.5 ? 'YES' : 'NO')) as TradePosition,
+  }));
+}
+
+/**
+ * Create trades with current entry prices
+ *
+ * Epic 8: Entry prices defined by creator at bet time.
+ * Fetches current prices and assigns to trades.
+ *
+ * @param tradeList - Trade list from snapshot
+ * @param backendUrl - Backend API URL
+ * @returns Trades with entry prices
+ */
+export async function createTradesWithEntryPrices(
+  tradeList: TradeList,
+  backendUrl: string
+): Promise<Trade[]> {
+  // First assign random positions
+  const tradesWithPositions = assignRandomPositions(tradeList.trades);
+
+  // Then fetch current prices for each
+  const tradesWithPrices = await Promise.all(
+    tradesWithPositions.map(async (trade) => {
+      try {
+        const entryPrice = await fetchCurrentPrice(trade.source, trade.ticker, backendUrl);
+        return {
+          ...trade,
+          entryPrice,
+        };
+      } catch (error) {
+        // Use snapshot price as fallback
+        console.warn(`Failed to fetch price for ${trade.ticker}, using snapshot price`);
+        return trade;
+      }
+    })
+  );
+
+  return tradesWithPrices;
+}
+
+/**
+ * Calculate the trades hash for on-chain commitment
+ *
+ * Epic 8: betHash = keccak256(trades JSON)
+ * Story 9.2: Updated to use keccak256 from ethers.js to match backend.
+ *
+ * @param trades - Array of trades
+ * @returns Hash string (0x prefixed)
+ */
+export function calculateTradesHash(trades: Trade[]): string {
+  const json = JSON.stringify(trades);
+  return keccak256(toUtf8Bytes(json));
+}
+
+/**
+ * Calculate bitmap hash for on-chain commitment
+ *
+ * Story 9.2: New bitmap-based hash for compact position encoding.
+ * Hash = keccak256(snapshot_id_bytes + bitmap_bytes)
+ *
+ * This MUST match the backend Rust implementation exactly.
+ *
+ * @param snapshotId - Snapshot ID string
+ * @param trades - Array of trades with positions
+ * @returns Hash string (0x prefixed)
+ */
+export function calculateBitmapTradesHash(snapshotId: string, trades: Trade[]): string {
+  // Extract positions and encode as bitmap
+  const positions = trades.map(t => t.position as 'LONG' | 'SHORT' | 'YES' | 'NO');
+  const bitmap = encodePositionBitmap(positions);
+
+  // Compute hash: keccak256(snapshotId_bytes + bitmap_bytes)
+  return computeBitmapHash(snapshotId, bitmap);
+}
+
+/**
+ * Serialize trades to JSON string
+ *
+ * @param trades - Array of trades
+ * @returns JSON string
+ */
+export function serializeTrades(trades: Trade[]): string {
+  return JSON.stringify(trades);
+}
+
+/**
+ * Create opposite trades for matching (counter-portfolio)
+ *
+ * Epic 8: Matcher takes opposite positions
+ *
+ * @param trades - Original trades
+ * @returns Trades with opposite positions
+ */
+export function createCounterTrades(trades: Trade[]): Trade[] {
+  return trades.map(trade => ({
+    ...trade,
+    position: getOppositePosition(trade.position),
+  }));
+}
+
+/**
+ * Get the opposite position
+ */
+function getOppositePosition(position: TradePosition): TradePosition {
+  switch (position) {
+    case 'LONG': return 'SHORT';
+    case 'SHORT': return 'LONG';
+    case 'YES': return 'NO';
+    case 'NO': return 'YES';
+  }
+}
+
+/**
+ * Check if a price is reasonable (within tolerance of current market)
+ *
+ * @param entryPrice - Entry price to check
+ * @param currentPrice - Current market price
+ * @param tolerance - Max allowed deviation (default 5%)
+ * @returns true if price is reasonable
+ */
+export function isPriceReasonable(
+  entryPrice: number,
+  currentPrice: number,
+  tolerance: number = 0.05
+): boolean {
+  if (currentPrice === 0) return false;
+  const deviation = Math.abs(entryPrice - currentPrice) / currentPrice;
+  return deviation <= tolerance;
 }

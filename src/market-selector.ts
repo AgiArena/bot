@@ -10,6 +10,7 @@
 
 import { join } from "path";
 import { Logger } from "./logger";
+import { fetchWithTls } from "./fetch-utils";
 
 // Initialize logger for this module with console output
 const logsDir = process.env.AGENT_LOGS_DIR || join(process.cwd(), "agent");
@@ -64,6 +65,34 @@ export interface MarketScore {
 }
 
 /**
+ * Crypto market data from backend API (CoinGecko prices)
+ */
+export interface CryptoMarket {
+  coinId: string;
+  symbol: string;
+  name: string;
+  priceUsd: number;
+  marketCap: number;
+  volume24h: number;
+  priceChange24h: number;
+  lastUpdated: string;
+}
+
+/**
+ * Crypto market evaluation score for selection
+ */
+export interface CryptoMarketScore {
+  coinId: string;
+  symbol: string;
+  name: string;
+  priceUsd: number;
+  priceChange24h: number; // Signed 24h price change (for direction)
+  volatility: number; // Absolute price change as proxy for volatility
+  score: number;
+  reasons: string[];
+}
+
+/**
  * Market selector configuration
  */
 export interface MarketSelectorConfig {
@@ -82,61 +111,159 @@ const DEFAULT_CONFIG: MarketSelectorConfig = {
   maxMarketsToFetch: 500,
 };
 
+// ============================================================================
+// Epic 8: Snapshot-based Market Selection (New APIs)
+// ============================================================================
+
 /**
- * Fetch markets from backend API with filters
+ * Trade list item from a snapshot
+ */
+export interface TradeListItem {
+  ticker: string;
+  source: string;          // 'coingecko' | 'polymarket' | 'gamma'
+  priceAtSnapshot: number; // Entry price from snapshot
+  rank: number;
+}
+
+/**
+ * Snapshot data from GET /api/snapshots/latest/{categoryId}
+ */
+export interface Snapshot {
+  snapshotId: string;
+  categoryId: string;
+  listSize: number;
+  takenAt: string;  // ISO timestamp
+  trades: TradeListItem[];
+}
+
+/**
+ * Fetch the latest snapshot for a category
+ *
+ * Epic 8: Uses new GET /api/snapshots/latest/{categoryId} endpoint
+ * This is the primary way bots get market data for category-based betting.
+ */
+export async function fetchLatestSnapshot(
+  categoryId: string,
+  config: Partial<MarketSelectorConfig> = {}
+): Promise<Snapshot | null> {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+
+  logger.info(`Fetching latest snapshot for category: ${categoryId}`);
+
+  try {
+    const url = `${cfg.backendUrl}/api/snapshots/latest/${categoryId}`;
+
+    const response = await fetchWithTls(url, {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        logger.warn(`No snapshot found for category: ${categoryId}`);
+        return null;
+      }
+      const errorText = await response.text();
+      throw new Error(`Failed to fetch snapshot: ${response.status} - ${errorText}`);
+    }
+
+    const snapshot = await response.json() as Snapshot;
+    logger.info(`Fetched snapshot ${snapshot.snapshotId}: ${snapshot.trades.length} trades from ${snapshot.takenAt}`);
+    return snapshot;
+  } catch (error) {
+    logger.error(`Snapshot fetch error: ${error}`);
+    return null;
+  }
+}
+
+/**
+ * Convert snapshot trades to MarketScore format for compatibility
+ *
+ * This allows using snapshot data with existing portfolio creation functions.
+ */
+export function snapshotTradesToMarketScores(trades: TradeListItem[]): MarketScore[] {
+  return trades.map((trade) => ({
+    marketId: `${trade.source}:deterministic:${trade.ticker}`,
+    question: trade.ticker,
+    priceYes: trade.priceAtSnapshot,
+    priceNo: 1 - trade.priceAtSnapshot,
+    score: 100 - trade.rank, // Higher rank = lower score
+    reasons: [`rank: ${trade.rank}`, trade.source],
+    endDate: null, // Snapshots don't have end dates - they resolve at snapshot time
+  }));
+}
+
+/**
+ * Fetch markets from backend API with filters (with pagination)
  */
 export async function fetchMarkets(
   config: Partial<MarketSelectorConfig> = {}
 ): Promise<Market[]> {
   const cfg = { ...DEFAULT_CONFIG, ...config };
+  const allMarkets: Market[] = [];
+  let page = 1;
+  const pageSize = 500;
+  let hasMore = true;
 
-  const url = new URL("/api/markets", cfg.backendUrl);
-  url.searchParams.set("active", "true");
-  url.searchParams.set("minVolume", cfg.minVolume.toString());
-  url.searchParams.set("limit", cfg.maxMarketsToFetch.toString());
+  logger.info(`Fetching all open markets with volume >= ${cfg.minVolume}...`);
 
-  logger.info(`Fetching markets from ${url.toString()}`);
+  while (hasMore) {
+    const url = new URL("/api/markets", cfg.backendUrl);
+    url.searchParams.set("active", "true");
+    url.searchParams.set("open", "true"); // Only non-closed markets
+    url.searchParams.set("minVolume", cfg.minVolume.toString());
+    url.searchParams.set("limit", pageSize.toString());
+    url.searchParams.set("page", page.toString());
 
-  try {
-    // Use Bun's fetch with TLS verification disabled for self-signed certs
-    const response = await fetch(url.toString(), {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      // @ts-ignore - Bun-specific option to disable TLS verification
-      tls: {
-        rejectUnauthorized: false,
-      },
-    });
+    try {
+      const response = await fetchWithTls(url.toString(), {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to fetch markets: ${response.status} - ${errorText}`);
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Failed to fetch markets: ${response.status} - ${errorText}`);
+      }
+
+      const data = await response.json();
+
+      // Parse string values to numbers
+      const markets: Market[] = data.markets.map((m: Record<string, unknown>) => ({
+        marketId: String(m.marketId || ""),
+        question: String(m.question || ""),
+        priceYes: m.priceYes != null ? parseFloat(String(m.priceYes)) : null,
+        priceNo: m.priceNo != null ? parseFloat(String(m.priceNo)) : null,
+        volume: parseFloat(String(m.volume || "0")),
+        liquidity: parseFloat(String(m.liquidity || "0")),
+        isActive: Boolean(m.isActive),
+        endDate: m.endDate ? String(m.endDate) : null,
+        category: m.category ? String(m.category) : null,
+        lastUpdated: String(m.lastUpdated || new Date().toISOString()),
+      }));
+
+      allMarkets.push(...markets);
+      hasMore = data.pagination.hasMore;
+
+      if (page === 1) {
+        logger.info(`Total markets available: ${data.pagination.total}`);
+      }
+
+      page++;
+
+      // Safety limit to prevent infinite loops
+      if (page > 50) {
+        logger.warn(`Stopping at page 50 (${allMarkets.length} markets fetched)`);
+        break;
+      }
+    } catch (error) {
+      logger.error(`Market fetch error on page ${page}: ${error}`);
+      throw error;
     }
-
-    const data = await response.json();
-    logger.info(`Fetched ${data.markets.length} markets (total: ${data.pagination.total})`);
-
-    // Parse string values to numbers (API returns strings for numeric fields)
-    const markets: Market[] = data.markets.map((m: Record<string, unknown>) => ({
-      marketId: String(m.marketId || ""),
-      question: String(m.question || ""),
-      priceYes: m.priceYes != null ? parseFloat(String(m.priceYes)) : null,
-      priceNo: m.priceNo != null ? parseFloat(String(m.priceNo)) : null,
-      volume: parseFloat(String(m.volume || "0")),
-      liquidity: parseFloat(String(m.liquidity || "0")),
-      isActive: Boolean(m.isActive),
-      endDate: m.endDate ? String(m.endDate) : null,
-      category: m.category ? String(m.category) : null,
-      lastUpdated: String(m.lastUpdated || new Date().toISOString()),
-    }));
-
-    return markets;
-  } catch (error) {
-    logger.error(`Market fetch error: ${error}`);
-    throw error;
   }
+
+  logger.info(`Fetched ${allMarkets.length} markets total`);
+  return allMarkets;
 }
 
 /**
@@ -171,12 +298,8 @@ export function filterMarkets(
       }
     }
 
-    // Must have valid prices (odds between 0.01 and 0.99)
-    const priceYes = market.priceYes ?? 0;
-    const priceNo = market.priceNo ?? 0;
-    if (priceYes <= 0.01 || priceYes >= 0.99) {
-      return false; // Market essentially resolved (>99% or <1%)
-    }
+    // Note: We no longer filter by price here since is_closed filter on server
+    // handles resolved markets. Price-based filtering was unreliable.
 
     return true;
   });
@@ -319,7 +442,7 @@ export async function getTradableMarkets(
 /**
  * Randomly select markets from the tradeable pool
  *
- * Used by bots to add variety to their portfolios
+ * Uses Fisher-Yates shuffle for efficiency when selecting many markets
  */
 export function randomlySelectMarkets(
   markets: MarketScore[],
@@ -329,26 +452,644 @@ export function randomlySelectMarkets(
     return markets;
   }
 
-  // Weighted random selection based on score
-  const totalScore = markets.reduce((sum, m) => sum + m.score, 0);
-  const selected: MarketScore[] = [];
-  const available = [...markets];
+  // For large selections (>100), use simple shuffle for efficiency
+  // Fisher-Yates shuffle is O(n) vs O(n²) for weighted selection
+  const shuffled = [...markets];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
 
-  while (selected.length < count && available.length > 0) {
-    // Random weighted selection
-    let random = Math.random() * totalScore;
-    let index = 0;
+  return shuffled.slice(0, count);
+}
 
-    for (let i = 0; i < available.length; i++) {
-      random -= available[i].score;
-      if (random <= 0) {
-        index = i;
-        break;
-      }
+// ============================================================================
+// Crypto Market Functions (CoinGecko)
+// ============================================================================
+
+/**
+ * Fetch crypto markets from backend API
+ */
+export async function fetchCryptoMarkets(
+  config: Partial<MarketSelectorConfig> = {}
+): Promise<CryptoMarket[]> {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+
+  logger.info("Fetching crypto markets from backend...");
+
+  try {
+    const url = new URL("/api/crypto/prices", cfg.backendUrl);
+
+    const response = await fetchWithTls(url.toString(), {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to fetch crypto markets: ${response.status} - ${errorText}`);
     }
 
-    selected.push(available[index]);
-    available.splice(index, 1);
+    const data = await response.json();
+
+    // Parse the response - expected format: { prices: CryptoMarket[] }
+    const prices = data.prices || data;
+    const markets: CryptoMarket[] = (Array.isArray(prices) ? prices : []).map((p: Record<string, unknown>) => ({
+      coinId: String(p.coinId || p.coin_id || ""),
+      symbol: String(p.symbol || "").toUpperCase(),
+      name: String(p.name || p.coinId || ""),
+      priceUsd: parseFloat(String(p.priceUsd || p.price_usd || "0")),
+      marketCap: parseFloat(String(p.marketCap || p.market_cap || "0")),
+      volume24h: parseFloat(String(p.volume24h || p.volume_24h || "0")),
+      priceChange24h: parseFloat(String(p.priceChange24h || p.price_change_24h || "0")),
+      lastUpdated: String(p.lastUpdated || p.last_updated || new Date().toISOString()),
+    }));
+
+    logger.info(`Fetched ${markets.length} crypto markets`);
+    return markets;
+  } catch (error) {
+    logger.error(`Crypto market fetch error: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Score crypto markets for trading
+ *
+ * Scoring factors:
+ * - Volatility (price change 24h) - higher is better for trading
+ * - Volume - higher is better for liquidity
+ * - Market cap - prefer major coins for reliability
+ */
+export function scoreCryptoMarkets(markets: CryptoMarket[]): CryptoMarketScore[] {
+  return markets.map((market) => {
+    const reasons: string[] = [];
+    let score = 50; // Base score
+
+    // Volatility bonus (absolute price change)
+    const volatility = Math.abs(market.priceChange24h);
+    if (volatility > 5) {
+      score += 20;
+      reasons.push("high-volatility");
+    } else if (volatility > 2) {
+      score += 10;
+      reasons.push("med-volatility");
+    }
+
+    // Volume bonus (normalized)
+    if (market.volume24h > 1_000_000_000) {
+      score += 15;
+      reasons.push("high-volume");
+    } else if (market.volume24h > 100_000_000) {
+      score += 10;
+      reasons.push("med-volume");
+    }
+
+    // Market cap bonus (prefer major coins)
+    if (market.marketCap > 10_000_000_000) {
+      score += 15;
+      reasons.push("large-cap");
+    } else if (market.marketCap > 1_000_000_000) {
+      score += 10;
+      reasons.push("mid-cap");
+    }
+
+    return {
+      coinId: market.coinId,
+      symbol: market.symbol,
+      name: market.name,
+      priceUsd: market.priceUsd,
+      priceChange24h: market.priceChange24h,
+      volatility,
+      score,
+      reasons,
+    };
+  }).sort((a, b) => b.score - a.score);
+}
+
+/**
+ * Get tradeable crypto markets
+ *
+ * Fetches, scores, and returns best crypto markets for trading
+ */
+export async function getTradableCryptoMarkets(
+  config: Partial<MarketSelectorConfig> = {},
+  count: number = 3
+): Promise<CryptoMarketScore[]> {
+  const markets = await fetchCryptoMarkets(config);
+
+  if (markets.length === 0) {
+    logger.warn("No crypto markets found!");
+    return [];
+  }
+
+  const scored = scoreCryptoMarkets(markets);
+  const selected = scored.slice(0, count);
+
+  logger.info(`Selected ${selected.length} crypto markets for trading:`);
+  for (const market of selected) {
+    logger.info(`  - ${market.symbol}: score=${market.score} (${market.reasons.join(", ")})`);
+  }
+
+  return selected;
+}
+
+// ============================================================================
+// Stock Market Functions (Finnhub via /api/market-prices?source=stocks)
+// ============================================================================
+
+/**
+ * Stock market data from backend unified market_prices API
+ */
+export interface StockMarket {
+  assetId: string;
+  symbol: string;
+  name: string;
+  category: string | null;
+  priceUsd: number;
+  prevClose: number | null;
+  priceChangePct: number | null;
+  volume24h: number | null;
+  marketCap: number | null;
+  fetchedAt: string;
+}
+
+/**
+ * Stock market evaluation score for selection
+ */
+export interface StockMarketScore {
+  symbol: string;
+  name: string;
+  priceUsd: number;
+  priceChangePct: number;
+  score: number;
+  reasons: string[];
+}
+
+/**
+ * Fetch stock markets from backend unified market-prices API
+ */
+export async function fetchStockMarkets(
+  config: Partial<MarketSelectorConfig> = {},
+  limit: number = 500
+): Promise<StockMarket[]> {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+
+  logger.info("Fetching stock markets from backend...");
+
+  try {
+    const url = new URL("/api/market-prices", cfg.backendUrl);
+    url.searchParams.set("source", "stocks");
+    url.searchParams.set("limit", limit.toString());
+
+    const response = await fetchWithTls(url.toString(), {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to fetch stock markets: ${response.status} - ${errorText}`);
+    }
+
+    const data = await response.json();
+    const prices = data.prices || [];
+
+    const markets: StockMarket[] = prices.map((p: Record<string, unknown>) => ({
+      assetId: String(p.assetId || p.asset_id || ""),
+      symbol: String(p.symbol || ""),
+      name: String(p.name || p.symbol || ""),
+      category: p.category ? String(p.category) : null,
+      priceUsd: parseFloat(String(p.priceUsd || p.price_usd || "0")),
+      prevClose: p.prevClose ? parseFloat(String(p.prevClose)) : null,
+      priceChangePct: p.priceChangePct ? parseFloat(String(p.priceChangePct)) : null,
+      volume24h: p.volume24h ? parseFloat(String(p.volume24h)) : null,
+      marketCap: p.marketCap ? parseFloat(String(p.marketCap)) : null,
+      fetchedAt: String(p.fetchedAt || new Date().toISOString()),
+    }));
+
+    logger.info(`Fetched ${markets.length} stock markets`);
+    return markets;
+  } catch (error) {
+    logger.error(`Stock market fetch error: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Score stock markets for trading
+ *
+ * Scoring by price change (volatility) — more volatile stocks = more interesting
+ */
+export function scoreStockMarkets(markets: StockMarket[]): StockMarketScore[] {
+  return markets.map((market) => {
+    const reasons: string[] = [];
+    let score = 50;
+
+    const pctChange = Math.abs(market.priceChangePct || 0);
+    if (pctChange > 3) {
+      score += 20;
+      reasons.push("high-volatility");
+    } else if (pctChange > 1) {
+      score += 10;
+      reasons.push("med-volatility");
+    }
+
+    if (market.category) {
+      reasons.push(market.category);
+    }
+
+    return {
+      symbol: market.symbol,
+      name: market.name,
+      priceUsd: market.priceUsd,
+      priceChangePct: market.priceChangePct || 0,
+      score,
+      reasons,
+    };
+  }).sort((a, b) => b.score - a.score);
+}
+
+/**
+ * Get tradeable stock markets
+ */
+export async function getTradableStockMarkets(
+  config: Partial<MarketSelectorConfig> = {},
+  count: number = 100
+): Promise<StockMarketScore[]> {
+  const markets = await fetchStockMarkets(config);
+
+  if (markets.length === 0) {
+    logger.warn("No stock markets found!");
+    return [];
+  }
+
+  const scored = scoreStockMarkets(markets);
+  const selected = scored.slice(0, count);
+
+  logger.info(`Selected ${selected.length} stock markets for trading:`);
+  for (const market of selected.slice(0, 5)) {
+    logger.info(`  - ${market.symbol}: score=${market.score} (${market.reasons.join(", ")})`);
+  }
+
+  return selected;
+}
+
+// ============================================================================
+// Weather Market Functions (Open-Meteo via /api/weather)
+// ============================================================================
+
+/**
+ * Weather city data from backend API
+ */
+export interface WeatherCity {
+  cityId: string;
+  name: string;
+  countryCode: string;
+  latitude: number;
+  longitude: number;
+  population: number;
+  rank: number;
+}
+
+/**
+ * Weather reading data from backend API
+ */
+export interface WeatherReading {
+  cityId: string;
+  cityName: string;
+  countryCode: string;
+  metric: string;
+  value: number;
+  unit: string;
+  recordedAt: string;
+}
+
+/**
+ * Weather market evaluation score for selection
+ */
+export interface WeatherMarketScore {
+  marketId: string;        // Format: "cityId-metric" (e.g., "paris-fr-temperature_2m")
+  cityId: string;
+  cityName: string;
+  metric: string;
+  value: number;
+  unit: string;
+  score: number;
+  reasons: string[];
+}
+
+/**
+ * Fetch weather readings from backend API
+ */
+export async function fetchWeatherMarkets(
+  config: Partial<MarketSelectorConfig> = {},
+  metric?: string,
+  maxRank?: number
+): Promise<WeatherReading[]> {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+
+  logger.info(`Fetching weather markets from backend (metric: ${metric || "all"}, maxRank: ${maxRank || "all"})...`);
+
+  try {
+    const url = new URL("/api/weather/readings", cfg.backendUrl);
+    url.searchParams.set("limit", "500");
+    if (metric) {
+      url.searchParams.set("metric", metric);
+    }
+    if (maxRank) {
+      url.searchParams.set("maxRank", maxRank.toString());
+    }
+
+    const response = await fetchWithTls(url.toString(), {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to fetch weather markets: ${response.status} - ${errorText}`);
+    }
+
+    const data = await response.json();
+    const readings = data.readings || [];
+
+    const markets: WeatherReading[] = readings.map((r: Record<string, unknown>) => ({
+      cityId: String(r.cityId || r.city_id || ""),
+      cityName: String(r.cityName || r.city_name || ""),
+      countryCode: String(r.countryCode || r.country_code || ""),
+      metric: String(r.metric || ""),
+      value: parseFloat(String(r.value || "0")),
+      unit: String(r.unit || ""),
+      recordedAt: String(r.recordedAt || r.recorded_at || new Date().toISOString()),
+    }));
+
+    logger.info(`Fetched ${markets.length} weather readings`);
+    return markets;
+  } catch (error) {
+    logger.error(`Weather market fetch error: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Score weather markets for trading
+ *
+ * Scoring factors:
+ * - City population rank (lower rank = larger city = higher priority)
+ * - Metric type (temperature often most interesting)
+ */
+export function scoreWeatherMarkets(readings: WeatherReading[]): WeatherMarketScore[] {
+  return readings.map((reading) => {
+    const reasons: string[] = [];
+    let score = 50; // Base score
+
+    // City/metric combination
+    const marketId = `${reading.cityId}-${reading.metric}`;
+
+    // Metric type bonus
+    if (reading.metric === "temperature_2m") {
+      score += 10;
+      reasons.push("temperature");
+    } else if (reading.metric === "rain") {
+      score += 8;
+      reasons.push("rain");
+    } else if (reading.metric === "wind_speed_10m") {
+      score += 6;
+      reasons.push("wind");
+    } else if (reading.metric === "pm2_5" || reading.metric === "ozone") {
+      score += 4;
+      reasons.push("air-quality");
+    }
+
+    // Country diversity bonus (encourage international coverage)
+    reasons.push(reading.countryCode);
+
+    return {
+      marketId,
+      cityId: reading.cityId,
+      cityName: reading.cityName,
+      metric: reading.metric,
+      value: reading.value,
+      unit: reading.unit,
+      score,
+      reasons,
+    };
+  }).sort((a, b) => b.score - a.score);
+}
+
+/**
+ * Get tradeable weather markets
+ *
+ * @param config - Market selector configuration
+ * @param count - Number of markets to return
+ * @param metric - Optional filter for specific metric (temperature_2m, rain, etc.)
+ * @param maxRank - Optional filter for top N cities by population
+ */
+export async function getTradableWeatherMarkets(
+  config: Partial<MarketSelectorConfig> = {},
+  count: number = 100,
+  metric?: string,
+  maxRank?: number
+): Promise<WeatherMarketScore[]> {
+  const readings = await fetchWeatherMarkets(config, metric, maxRank);
+
+  if (readings.length === 0) {
+    logger.warn("No weather markets found!");
+    return [];
+  }
+
+  const scored = scoreWeatherMarkets(readings);
+  const selected = scored.slice(0, count);
+
+  logger.info(`Selected ${selected.length} weather markets for trading:`);
+  for (const market of selected.slice(0, 5)) {
+    logger.info(`  - ${market.marketId}: ${market.value}${market.unit} score=${market.score} (${market.reasons.join(", ")})`);
+  }
+
+  return selected;
+}
+
+// ============================================================================
+// Generic Market Price Functions (Unified API)
+// ============================================================================
+
+import { SOURCE_CONFIG, type DataSource } from "./constants";
+
+/**
+ * Generic market price data from unified /api/market-prices endpoint
+ */
+export interface GenericMarketPrice {
+  assetId: string;
+  symbol: string;
+  name: string;
+  source: DataSource;
+  category: string | null;
+  priceUsd: number;
+  prevValue: number | null;
+  changePct: number | null;
+  fetchedAt: string;
+}
+
+/**
+ * Generic market score for any source
+ */
+export interface GenericMarketScore {
+  assetId: string;
+  symbol: string;
+  name: string;
+  source: DataSource;
+  priceUsd: number;
+  changePct: number;
+  score: number;
+  reasons: string[];
+}
+
+/**
+ * Fetch market prices from the unified /api/market-prices endpoint
+ *
+ * @param backendUrl - Backend API URL
+ * @param source - Data source to fetch (bls, fred, ecb, defi, stocks)
+ * @param category - Optional category filter
+ * @param limit - Maximum number of results
+ */
+export async function fetchMarketPrices(
+  backendUrl: string,
+  source: DataSource,
+  category?: string,
+  limit: number = 500
+): Promise<GenericMarketPrice[]> {
+  const config = SOURCE_CONFIG[source];
+  if (!config) {
+    logger.warn(`Unknown source: ${source}`);
+    return [];
+  }
+
+  logger.info(`Fetching ${source} market prices from backend...`);
+
+  try {
+    const url = new URL("/api/market-prices", backendUrl);
+    url.searchParams.set("source", source);
+    url.searchParams.set("limit", limit.toString());
+    if (category) {
+      url.searchParams.set("category", category);
+    }
+
+    const response = await fetchWithTls(url.toString(), {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to fetch ${source} prices: ${response.status} - ${errorText}`);
+    }
+
+    const data = await response.json() as { prices?: Record<string, unknown>[] };
+    const prices = data.prices || [];
+
+    const markets: GenericMarketPrice[] = prices.map((p) => ({
+      assetId: String(p.assetId || p.asset_id || ""),
+      symbol: String(p.symbol || ""),
+      name: String(p.name || p.symbol || ""),
+      source: source,
+      category: p.category ? String(p.category) : null,
+      priceUsd: parseFloat(String(p.priceUsd || p.price_usd || p.value || "0")),
+      prevValue: p.prevValue ? parseFloat(String(p.prevValue)) : null,
+      changePct: p.changePct ? parseFloat(String(p.changePct)) : null,
+      fetchedAt: String(p.fetchedAt || p.fetched_at || new Date().toISOString()),
+    }));
+
+    logger.info(`Fetched ${markets.length} ${source} market prices`);
+    return markets;
+  } catch (error) {
+    logger.error(`${source} market fetch error: ${error}`);
+    return [];
+  }
+}
+
+/**
+ * Score market prices for trading
+ *
+ * Generic scorer that works for any source - scores by volatility/change
+ * Economic sources get bonus for upcoming release dates (if available)
+ */
+export function scoreMarketPrices(
+  markets: GenericMarketPrice[],
+  source: DataSource
+): GenericMarketScore[] {
+  const config = SOURCE_CONFIG[source];
+  const isEconomic = config?.isEconomic || false;
+
+  return markets.map((market) => {
+    const reasons: string[] = [];
+    let score = 50; // Base score
+
+    // Volatility/change bonus
+    const changePct = Math.abs(market.changePct || 0);
+    if (changePct > 5) {
+      score += 25;
+      reasons.push("high-change");
+    } else if (changePct > 2) {
+      score += 15;
+      reasons.push("med-change");
+    } else if (changePct > 0.5) {
+      score += 5;
+      reasons.push("low-change");
+    }
+
+    // Economic source bonus
+    if (isEconomic) {
+      score += 10;
+      reasons.push("economic");
+    }
+
+    // Category bonus
+    if (market.category) {
+      reasons.push(market.category);
+    }
+
+    return {
+      assetId: market.assetId,
+      symbol: market.symbol,
+      name: market.name,
+      source: market.source,
+      priceUsd: market.priceUsd,
+      changePct: market.changePct || 0,
+      score,
+      reasons,
+    };
+  }).sort((a, b) => b.score - a.score);
+}
+
+/**
+ * Get tradable markets for any source
+ *
+ * @param backendUrl - Backend API URL
+ * @param source - Data source to fetch
+ * @param count - Number of markets to return
+ * @param category - Optional category filter
+ */
+export async function getTradableMarketsBySource(
+  backendUrl: string,
+  source: DataSource,
+  count: number = 100,
+  category?: string
+): Promise<GenericMarketScore[]> {
+  const config = { backendUrl };
+  const markets = await fetchMarketPrices(backendUrl, source, category);
+
+  if (markets.length === 0) {
+    logger.warn(`No ${source} markets found!`);
+    return [];
+  }
+
+  const scored = scoreMarketPrices(markets, source);
+  const selected = scored.slice(0, count);
+
+  logger.info(`Selected ${selected.length} ${source} markets for trading:`);
+  for (const market of selected.slice(0, 5)) {
+    logger.info(`  - ${market.symbol}: score=${market.score} (${market.reasons.join(", ")})`);
   }
 
   return selected;
