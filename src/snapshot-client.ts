@@ -202,14 +202,31 @@ export async function uploadTradesToBackend(
     console.log(`[SnapshotClient] Full upload for bet ${betId}: ${trades.length} trades`);
   }
 
-  const response = await fetchWithTls(`${backendUrl}/api/bets/${betId}/trades`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  // Retry logic: wait for backend to index the bet (can take a few seconds)
+  const maxRetries = 5;
+  const retryDelayMs = 2000;
 
-  if (!response.ok) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const response = await fetchWithTls(`${backendUrl}/api/bets/${betId}/trades`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (response.ok) {
+      console.log(`[SnapshotClient] Trades uploaded successfully for bet ${betId} (attempt ${attempt})`);
+      return;
+    }
+
     const errorText = await response.text();
+
+    // If bet not found, wait and retry (indexer may not have caught up)
+    if (response.status === 404 && attempt < maxRetries) {
+      console.log(`[SnapshotClient] Bet ${betId} not indexed yet, retrying in ${retryDelayMs}ms (attempt ${attempt}/${maxRetries})`);
+      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      continue;
+    }
+
     throw new Error(`Failed to upload trades: ${response.status} - ${errorText}`);
   }
 }
@@ -456,10 +473,13 @@ export async function uploadPositionBitmapWithRetry(
 
       // Retry only on transient errors that may resolve
       if (!result.success) {
-        // DB_ERROR is the only truly retryable error - transient database issues
-        // BET_NOT_FOUND, TRADE_LIST_NOT_FOUND are permanent failures - bet/snapshot doesn't exist
-        // HASH_MISMATCH, INVALID_BITMAP, POSITIONS_EXIST are also permanent - won't change on retry
-        const retryableCodes = ['DB_ERROR'];
+        // These errors may resolve on retry:
+        // - DB_ERROR: transient database issues
+        // - BET_NOT_FOUND: indexer may not have processed the bet yet (timing issue)
+        // These are permanent failures (don't retry):
+        // - TRADE_LIST_NOT_FOUND: snapshot doesn't exist
+        // - HASH_MISMATCH, INVALID_BITMAP, POSITIONS_EXIST: data mismatch
+        const retryableCodes = ['DB_ERROR', 'BET_NOT_FOUND'];
         if (result.code && retryableCodes.includes(result.code)) {
           throw new Error(`${result.code}: ${result.error}`);
         }

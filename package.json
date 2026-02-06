@@ -4,10 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun run src/run-trading-bot.ts",
-    "trading-bot": "bun run src/run-trading-bot.ts",
+    "start": "bun run src/run-bilateral-bot.ts",
     "notifier": "bun run src/notifier.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "test:vital": "bun run src/test-vital-e2e.ts",
+    "test:vital:a": "bun run src/test-vital-e2e.ts --scenario-a",
+    "test:vital:b": "bun run src/test-vital-e2e.ts --scenario-b"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "latest",
@@ -16,6 +18,7 @@
   },
   "devDependencies": {
     "@types/node": "^22",
-    "bun-types": "latest"
+    "bun-types": "latest",
+    "fzstd": "^0.1.1"
   }
 }

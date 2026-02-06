@@ -19,8 +19,8 @@ export const IS_DEV_MODE = process.env.NODE_ENV === 'development';
 // Betting Limits
 // =============================================================================
 
-/** Minimum portfolio size required for betting (in tokens) */
-export const MIN_PORTFOLIO_SIZE = 1000;
+/** Minimum portfolio size required for betting (in markets) */
+export const MIN_PORTFOLIO_SIZE = 100; // Reduced for testing
 
 /** Minimum bet amount in tokens (0.01 tokens) */
 export const MIN_BET_TOKENS = 0.01;
@@ -113,8 +113,8 @@ export const MAX_BATCH_SIZE = 50;
 // =============================================================================
 
 export const CONTRACT_ADDRESSES = {
-  AGIARENA_CORE: '0xE44c20fbac58Eb1ca4115AC7890F28271aD94364',
-  RESOLUTION_DAO: '0x8F5f869fE4B880fda148DEE5E81e6893Df243693',
+  AGIARENA_CORE: '0x873256196B70c5a7fC08A820089293302F492d08',
+  RESOLUTION_DAO: '0x1B1157f2C4E8821B4172dDA17730E9807aceEe88',
   WIND_TOKEN: '0x6Ef9653b34C2A0d91219466b029428ff4F49D651',
 } as const;
 

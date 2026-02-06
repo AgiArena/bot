@@ -79,3 +79,9 @@ export class Logger {
     await this.writeQueue;
   }
 }
+
+/**
+ * Default logger instance for use throughout the bot
+ * Logs to ./logs/agent.log
+ */
+export const logger = new Logger("./logs");

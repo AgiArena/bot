@@ -3,7 +3,8 @@ node_modules
 
 # environment
 .env
-.env.local
+.env.*
+!.env.example
 
 # misc
 .DS_Store
@@ -16,3 +17,10 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
+
+# Bot env files
+.env.bot1
+.env.bot2
+
+# Trade data
+data/

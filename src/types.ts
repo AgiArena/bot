@@ -161,16 +161,6 @@ export interface AgentState {
 export type TradeListSize = '1K' | '10K' | '100K' | 'ALL';
 
 /**
- * Trade horizon for position holding period
- * - short: Intraday or very short term (< 1 day)
- * - daily: Day trading (1 day)
- * - weekly: Swing trading (1 week)
- * - monthly: Position trading (1 month)
- * - quarterly: Long-term (3 months)
- */
-export type TradeHorizon = 'short' | 'daily' | 'weekly' | 'monthly' | 'quarterly';
-
-/**
  * Snapshot from backend API
  * Represents a point-in-time capture of market rankings
  */
@@ -186,14 +176,12 @@ export interface Snapshot {
  * Trade position from a snapshot trade list
  */
 export interface Trade {
-  id: string;               // "BTC/coingecko/price" or "paris-fr/openmeteo/temperature_2m"
+  id: string;               // "BTC/coingecko/price"
   ticker: string;
-  source: string;           // 'coingecko' | 'polymarket' | 'gamma' | 'openmeteo' | 'bls' | 'fred' | 'ecb' | 'defi'
+  source: string;           // 'coingecko' | 'polymarket' | 'gamma'
   method: string;           // 'price' | 'outcome'
   position: 'LONG' | 'SHORT' | 'YES' | 'NO';
   entryPrice: number;
-  /** Trade horizon - defaults to source default if not specified */
-  horizon?: TradeHorizon;
 }
 
 /**
